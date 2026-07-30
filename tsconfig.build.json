@@ -1,0 +1,8 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": { "noEmit": false, "outDir": "dist", "rootDir": "src" },
+  "include": ["src/**/*"],
+  // `testsupport.ts` is not a test file (it declares no `test()`), so the glob above does not catch
+  // it — but it exists only for the suite and truncates tables, which has no business in an image.
+  "exclude": ["src/**/*.test.ts", "src/testsupport.ts"]
+}

@@ -1,0 +1,631 @@
+/**
+ * The versioned schema.
+ *
+ * Rule 7 of docs/ecosystem/03 §2: versioned files, run by a one-shot job under an advisory lock,
+ * expand/contract only. Nothing here is executed by `index.ts` — `src/migrator.ts` is the only
+ * caller, and the service asserts the version rather than reaching it.
+ *
+ * **A released migration is immutable.** `@cloudsforge/db` checksums each one and refuses a run
+ * where the text changed after it was applied. The fix for a wrong migration is a new migration.
+ *
+ * ---------------------------------------------------------------------------------------------
+ * **This file is where the ledger's invariants live, and that is deliberate.**
+ *
+ * 04-domain-model.md §2.2 lists five invariants and states that they are enforced "in the
+ * database, not in application code". The reason is 00-current-state.md §3.3: `forge-pay`'s
+ * `ledger` table is single-sided — one `delta` column, no account, no counter-account, no journal
+ * grouping — so there is nothing for a balancing rule to attach to, and every rule that does exist
+ * lives in whichever route happened to write the row. A rule in a route is a rule that the next
+ * route forgets. A rule in a constraint is a rule that a bug, a migration, a psql session and a
+ * future service all have to obey.
+ *
+ * The five, and where each one is:
+ *
+ *   1. Sigma debits = Sigma credits per entry per asset  ->  v6, `ledger_assert_entry_balanced`,
+ *      a DEFERRED constraint trigger. The single most important line in the service.
+ *   2. Postings are immutable                            ->  v6, `ledger_refuse_mutation` trigger
+ *      plus REVOKE. Two mechanisms, because the trigger binds the table owner and the REVOKE
+ *      binds everyone else.
+ *   3. A correction is a new entry                       ->  v5, `reverses_entry_id`, and (2).
+ *   4. `idempotency_key` is unique                       ->  v5, a unique constraint, claimed in
+ *      the same transaction as the postings by `withIdempotency`.
+ *   5. A liability may not go negative                   ->  v7, `ledger_assert_no_overdraft` on
+ *      the balances projection.
+ * ---------------------------------------------------------------------------------------------
+ */
+
+import { JOBS_SCHEMA_SQL } from '@cloudsforge/jobs'
+import type { Migration } from '@cloudsforge/db'
+
+export const MIGRATIONS: readonly Migration[] = [
+  {
+    version: 1,
+    name: 'jobs',
+    // Taken verbatim from the runtime package so the table the claim query assumes and the table
+    // that exists cannot drift. Copying the DDL by hand is how a service ends up with a jobs table
+    // missing the (kind, key) unique constraint, which silently turns every recurring enqueue into
+    // a duplicate run.
+    up: JOBS_SCHEMA_SQL,
+  },
+
+  {
+    version: 2,
+    name: 'outbox',
+    up: `
+      create table if not exists outbox (
+        id             uuid        primary key default gen_random_uuid(),
+        topic          text        not null,
+        key            text        not null,
+        occurred_at    timestamptz not null default now(),
+        producer       text        not null,
+        version        integer     not null default 1,
+        actor          text,
+        correlation_id text,
+        payload        jsonb       not null default '{}'::jsonb,
+        published_at   timestamptz
+      );
+
+      -- The relay's access path. Partial on the unpublished set, so the index stays the size of
+      -- the backlog rather than the size of history.
+      create index if not exists outbox_unpublished_idx
+        on outbox (occurred_at)
+        where published_at is null;
+
+      create table if not exists event_subscriptions (
+        id         uuid        primary key default gen_random_uuid(),
+        topic      text        not null,
+        url        text        not null,
+        active     boolean     not null default true,
+        created_at timestamptz not null default now(),
+        constraint event_subscriptions_topic_url_uniq unique (topic, url)
+      );
+
+      -- Delivery is tracked per (event, subscription) rather than per event. With one flag on the
+      -- outbox row, one failing subscriber either blocks every other subscriber or causes the
+      -- event to be redelivered to all of them on each retry.
+      create table if not exists outbox_deliveries (
+        event_id        uuid        not null references outbox (id) on delete cascade,
+        subscription_id uuid        not null references event_subscriptions (id) on delete cascade,
+        delivered_at    timestamptz,
+        attempts        integer     not null default 0,
+        last_error      text,
+        primary key (event_id, subscription_id)
+      );
+    `,
+  },
+
+  {
+    version: 3,
+    name: 'inbox',
+    up: `
+      -- Delivery is at-least-once, so the consumer is what makes it effectively-once. The primary
+      -- key is the dedupe: a redelivered event conflicts and the handler is never re-run.
+      create table if not exists inbox (
+        topic       text        not null,
+        event_id    uuid        not null,
+        received_at timestamptz not null default now(),
+        primary key (topic, event_id)
+      );
+    `,
+  },
+
+  {
+    version: 4,
+    name: 'accounts',
+    up: `
+      -- The chart of accounts. Every unit of value in the platform sits in exactly one account.
+      create table if not exists accounts (
+        id                uuid        primary key default gen_random_uuid(),
+        subject           text        not null,
+        type              text        not null,
+        asset_code        text        not null,
+        purpose           text        not null,
+        status            text        not null default 'open',
+        overdraft_allowed boolean     not null default false,
+        created_at        timestamptz not null default now(),
+
+        constraint accounts_type_chk check (
+          type in ('liability', 'asset', 'revenue', 'expense', 'equity', 'clearing')
+        ),
+        constraint accounts_purpose_chk check (
+          purpose in ('available', 'reserved', 'escrow', 'treasury', 'fees', 'payout_due', 'suspense')
+        ),
+        constraint accounts_status_chk check (status in ('open', 'frozen', 'closed'))
+      );
+
+      -- INVARIANT: the account key is (subject, asset_code, purpose) and is unique.
+      --
+      -- 04-domain-model.md §2.1: "That single fact is what lets a user balance, a community
+      -- treasury, a marketplace escrow and a platform revenue line all live in one double-entry
+      -- system with no special cases." A second 'user:X available SHARD' account would split one
+      -- user's balance across two rows, and every sum over it would be quietly wrong.
+      create unique index if not exists accounts_key_uniq
+        on accounts (subject, asset_code, purpose);
+
+      create index if not exists accounts_subject_idx on accounts (subject);
+
+      -- Reconciliation sums custody asset accounts and user liability accounts per asset; without
+      -- this it is a sequential scan of the whole chart on every run.
+      create index if not exists accounts_type_asset_idx on accounts (type, asset_code);
+    `,
+  },
+
+  {
+    version: 5,
+    name: 'journal',
+    up: `
+      -- The financial source of truth. Append-only.
+      create table if not exists journal_entries (
+        id                  uuid        primary key,
+        kind                text        not null,
+        description         text,
+        -- Present on EVERY entry, unlike today's optional 'ledger.source' which only the
+        -- /internal/* routes populate — which is why per-product revenue is not derivable from
+        -- the existing estate at all (00-current-state.md §3.3).
+        originating_service text        not null,
+        actor               text        not null,
+        correlation_id      text        not null,
+        idempotency_key     text        not null,
+        -- INVARIANT 3: a correction is a new entry with this set. Never an edit.
+        reverses_entry_id   uuid        references journal_entries (id),
+        occurred_at         timestamptz not null,
+        recorded_at         timestamptz not null default now(),
+        metadata            jsonb       not null default '{}'::jsonb,
+
+        -- INVARIANT 4: unique, and claimed in the same transaction as the postings.
+        constraint journal_entries_idempotency_key_uniq unique (idempotency_key),
+
+        -- The closed set from 04-domain-model.md §2.2. It is also the audit vocabulary, which is
+        -- why it is a constraint rather than a convention: an entry kind nobody enumerated is an
+        -- entry that no report, no alert and no audit query will ever count.
+        constraint journal_entries_kind_chk check (kind in (
+          'deposit_credited', 'withdrawal_requested', 'withdrawal_settled', 'withdrawal_refunded',
+          'conversion', 'transfer', 'purchase', 'subscription_charge', 'fee_charged',
+          'reward_granted', 'market_escrow', 'market_settled', 'royalty_paid', 'trading_fill',
+          'performance_fee', 'creator_payout', 'treasury_spend', 'adjustment',
+          'reconciliation_correction', 'reversal'
+        )),
+
+        -- An entry cannot reverse itself. Cheap to state, and it makes the reversal chain a DAG.
+        constraint journal_entries_no_self_reversal_chk check (reverses_entry_id is distinct from id)
+      );
+
+      -- GET /entries is paginated by (recorded_at, id) and this is its access path. The existing
+      -- wallet returns the entire unpaginated ledger on every call; this index is what makes not
+      -- repeating that defect cheap.
+      create index if not exists journal_entries_recorded_idx
+        on journal_entries (recorded_at desc, id desc);
+
+      create index if not exists journal_entries_kind_idx on journal_entries (kind, recorded_at desc);
+      create index if not exists journal_entries_service_idx
+        on journal_entries (originating_service, recorded_at desc);
+      create index if not exists journal_entries_correlation_idx on journal_entries (correlation_id);
+
+      -- Partial: reversals are a small fraction of the journal, and "what reversed this" must stay
+      -- fast when the table is large.
+      create index if not exists journal_entries_reverses_idx
+        on journal_entries (reverses_entry_id)
+        where reverses_entry_id is not null;
+
+      create table if not exists postings (
+        id         uuid          primary key default gen_random_uuid(),
+        entry_id   uuid          not null references journal_entries (id),
+        account_id uuid          not null references accounts (id),
+        direction  text          not null,
+        -- numeric(78,0), never a float. 78 digits holds any uint256 (max ~1.16e77), which is what
+        -- an EVM token balance can be. The current estate stores these as TEXT, so the database
+        -- cannot add them up and every sum happens in application code that may or may not use
+        -- bigint.
+        amount     numeric(78,0) not null,
+        asset_code text          not null,
+        sequence   integer       not null,
+
+        constraint postings_direction_chk check (direction in ('debit', 'credit')),
+        -- Amounts carry magnitude only; direction lives in 'direction'. The old 'ledger.delta'
+        -- column encoded direction in the sign, and a posting set ported straight across from it
+        -- is the failure this refuses.
+        constraint postings_amount_positive_chk check (amount > 0),
+        constraint postings_sequence_chk check (sequence >= 0),
+        -- A posting has a stable identity within its entry, which is what lets a reversal be
+        -- matched to the posting it mirrors.
+        constraint postings_entry_sequence_uniq unique (entry_id, sequence)
+      );
+
+      create index if not exists postings_entry_idx on postings (entry_id);
+      create index if not exists postings_account_idx on postings (account_id, asset_code);
+      -- The replay path: the rebuild job reads every posting in entry order.
+      create index if not exists postings_replay_idx on postings (entry_id, sequence);
+    `,
+  },
+
+  {
+    version: 6,
+    name: 'journal_invariants',
+    up: `
+      -- =========================================================================================
+      -- INVARIANT 1: Sigma debits = Sigma credits, per entry, per asset_code.
+      --
+      -- **This is the single most important thing in the service.**
+      --
+      -- It is a DEFERRED constraint trigger, which is the whole point. An entry is written as
+      -- several INSERTs, so it is unbalanced between the first posting and the last; an immediate
+      -- check would reject every legal entry. Deferring to COMMIT means the check runs once the
+      -- transaction has finished writing and before it is durable — so a transaction that would
+      -- commit an unbalanced entry fails at COMMIT and takes the whole entry with it. There is no
+      -- window in which an unbalanced entry exists.
+      --
+      -- Per asset, not per entry, because an entry may legitimately touch two assets: a conversion
+      -- debits a user's EMBER and credits their Shards in one atomic entry, and those two totals
+      -- have no arithmetic relationship whatsoever. Summing across assets would make a nonsense
+      -- entry balance and a correct one fail. This mirrors 'balanceEntry' in contracts-money,
+      -- which is the same rule expressed for the application; neither is a substitute for the
+      -- other, because contracts-money cannot bind a psql session and this cannot return a typed
+      -- diagnosis to an API caller.
+      -- =========================================================================================
+      create or replace function ledger_assert_entry_balanced() returns trigger
+        language plpgsql
+      as $$
+      declare
+        target_entry uuid;
+        offending    record;
+        posting_count integer;
+      begin
+        -- Fired from both journal_entries (NEW.id) and postings (NEW.entry_id), so that an entry
+        -- with no postings at all is caught as well as one whose postings do not balance.
+        if tg_table_name = 'journal_entries' then
+          target_entry := new.id;
+        else
+          target_entry := new.entry_id;
+        end if;
+
+        -- The entry may have been deleted later in the same transaction. Nothing to check.
+        if not exists (select 1 from journal_entries where id = target_entry) then
+          return null;
+        end if;
+
+        select count(*) into posting_count from postings where entry_id = target_entry;
+
+        -- An entry that moves nothing is a bug in the caller, not an entry. It is also exactly
+        -- what today's ledger writes as a breadcrumb: withdrawal request, refund and
+        -- convert-to-ember all write 'delta: 0' rows (00-current-state.md §3.3).
+        if posting_count = 0 then
+          raise exception
+            'entry % has no postings; an entry that moves nothing is not an entry', target_entry
+            using errcode = 'check_violation';
+        end if;
+
+        -- Per asset: the debit side and the credit side must both exist and must be equal. A
+        -- single-sided asset is reported distinctly because it is precisely what the table this
+        -- replaces could express and nothing else.
+        for offending in
+          select
+            p.asset_code,
+            coalesce(sum(p.amount) filter (where p.direction = 'debit'), 0)  as debits,
+            coalesce(sum(p.amount) filter (where p.direction = 'credit'), 0) as credits
+          from postings p
+          where p.entry_id = target_entry
+          group by p.asset_code
+          having coalesce(sum(p.amount) filter (where p.direction = 'debit'), 0)
+               <> coalesce(sum(p.amount) filter (where p.direction = 'credit'), 0)
+        loop
+          raise exception
+            'entry % does not balance for %: debits %, credits %, out by %',
+            target_entry, offending.asset_code, offending.debits, offending.credits,
+            offending.debits - offending.credits
+            using errcode = 'check_violation';
+        end loop;
+
+        return null;
+      end;
+      $$;
+
+      -- DEFERRABLE INITIALLY DEFERRED: the check happens at COMMIT, not at INSERT.
+      drop trigger if exists journal_entries_balanced on journal_entries;
+      create constraint trigger journal_entries_balanced
+        after insert on journal_entries
+        deferrable initially deferred
+        for each row execute function ledger_assert_entry_balanced();
+
+      -- The same check on postings, so that postings appended to an already-committed entry in a
+      -- later transaction cannot unbalance it. Without this, the entry-level trigger only ever
+      -- guards the transaction that created the entry.
+      drop trigger if exists postings_balanced on postings;
+      create constraint trigger postings_balanced
+        after insert on postings
+        deferrable initially deferred
+        for each row execute function ledger_assert_entry_balanced();
+
+      -- =========================================================================================
+      -- INVARIANT 2: postings are immutable. No UPDATE, no DELETE.
+      --
+      -- Enforced twice, because the two mechanisms bind different people:
+      --
+      --   * The REVOKE below binds every role that is not the table's owner. It is the real
+      --     access control and it is what the service's own database role runs under.
+      --   * The trigger binds EVERYONE, including the owner and a superuser holding a psql
+      --     session. Table privileges are not checked for the owner, so a REVOKE alone would
+      --     leave the one account most likely to be used for a well-meant "quick fix" able to
+      --     rewrite history silently.
+      --
+      -- A correction is a new entry with reverses_entry_id set (INVARIANT 3). That is not a
+      -- stylistic preference: an audit trail that shows only the fix, and not the mistake, cannot
+      -- be used to answer "what did we think was true on the 3rd".
+      -- =========================================================================================
+      create or replace function ledger_refuse_mutation() returns trigger
+        language plpgsql
+      as $$
+      begin
+        raise exception
+          'postings are append-only: % is refused. Post a reversing entry instead (reverses_entry_id).',
+          tg_op
+          using errcode = 'restrict_violation';
+      end;
+      $$;
+
+      drop trigger if exists postings_immutable on postings;
+      create trigger postings_immutable
+        before update or delete on postings
+        for each row execute function ledger_refuse_mutation();
+
+      -- Journal entries are append-only for the same reason. The one column a correction touches
+      -- is on the NEW entry, never the old one.
+      drop trigger if exists journal_entries_immutable on journal_entries;
+      create trigger journal_entries_immutable
+        before update or delete on journal_entries
+        for each row execute function ledger_refuse_mutation();
+
+      -- The privilege half. PUBLIC rather than a named role: the service's database user differs
+      -- per environment, and granting the shape rather than the name means this migration does not
+      -- have to know it. A deployment that runs the service as a non-owner gets defence in depth;
+      -- one that runs it as the owner still has the triggers above.
+      revoke update, delete, truncate on postings from public;
+      revoke update, delete, truncate on journal_entries from public;
+      grant select, insert on postings to public;
+      grant select, insert on journal_entries to public;
+    `,
+  },
+
+  {
+    version: 7,
+    name: 'balances',
+    up: `
+      -- A PROJECTION, not a source of truth (04-domain-model.md §2.3).
+      --
+      -- Maintained transactionally with each entry and rebuildable from the journal by replay.
+      -- This is the difference from today, where 'wallets.shards' *is* the truth and nothing can
+      -- check it: there is no journal to replay it from, so a wrong balance is wrong for ever.
+      create table if not exists balances (
+        account_id     uuid          not null references accounts (id),
+        asset_code     text          not null,
+        -- Held in the account's own NORMAL direction (contracts-money 'normalBalance'), so the
+        -- number is "how much of this account there is" for both a liability and an asset, and
+        -- nobody has to hold the sign convention in their head a second time. It is therefore
+        -- signed: a negative value means the account has gone the wrong side of zero, which is
+        -- exactly what the overdraft trigger below exists to refuse.
+        amount         numeric(78,0) not null default 0,
+        -- The last entry folded in. A rebuild compares against this to prove it replayed the same
+        -- journal the projection was built from.
+        as_of_entry_id uuid          references journal_entries (id),
+        updated_at     timestamptz   not null default now(),
+
+        primary key (account_id, asset_code)
+      );
+
+      -- =========================================================================================
+      -- INVARIANT 5: a liability account may not go negative unless overdraft_allowed.
+      --
+      -- A user liability going negative means we have paid out value the user never had. That
+      -- must fail loudly at the posting, not be discovered at the month end — so this is an
+      -- IMMEDIATE trigger, not a deferred one: it fires on the balance write itself, inside the
+      -- posting transaction, and names the account.
+      --
+      -- **AFTER INSERT OR UPDATE, not BEFORE, and that is not a stylistic choice.**
+      --
+      -- The projection is written with INSERT ... ON CONFLICT DO UPDATE, where the inserted
+      -- amount column is the DELTA and the conflict path adds it to the stored balance. Postgres fires
+      -- BEFORE INSERT row triggers *before* it detects the conflict, so a BEFORE trigger sees
+      -- NEW.amount = the raw delta rather than the resulting balance. Every debit would then look
+      -- like a negative balance: spending 100 of a 100 balance would be refused as an overdraft,
+      -- and — far worse — the rule would appear to work, because a debit against an account with
+      -- no balance row at all fails for the right reason by accident. An AFTER trigger fires once,
+      -- on the row version actually written, which is the only version the invariant is about.
+      --
+      -- Concurrency: ON CONFLICT DO UPDATE takes a row lock on the balance row and re-reads the
+      -- winning tuple, so two transactions debiting one account serialise on it and the second
+      -- computes its delta against the first's committed amount. That is what makes "N parallel
+      -- debits never drive a liability negative" true rather than merely likely.
+      --
+      -- Overdraft is permitted only for 'clearing' and 'suspense', which hold value in transit
+      -- that is owed onwards — mirroring 'permitsOverdraft' and 'wouldOverdraw' in contracts-money.
+      -- =========================================================================================
+      create or replace function ledger_assert_no_overdraft() returns trigger
+        language plpgsql
+      as $$
+      declare
+        acct record;
+      begin
+        if new.amount >= 0 then
+          return null;
+        end if;
+
+        select a.subject, a.type, a.purpose, a.overdraft_allowed
+          into acct
+          from accounts a
+         where a.id = new.account_id;
+
+        if acct is null then
+          raise exception 'balance references unknown account %', new.account_id
+            using errcode = 'foreign_key_violation';
+        end if;
+
+        -- A clearing account nets to zero over a settled period and may legitimately sit either
+        -- side of zero within one. A non-zero clearing balance is reconciliation's business, not
+        -- a constraint's.
+        if acct.type = 'clearing' then
+          return null;
+        end if;
+        if acct.overdraft_allowed or acct.purpose = 'suspense' then
+          return null;
+        end if;
+
+        raise exception
+          'account % (% %) would go to % — a % account may not go negative without overdraft_allowed',
+          new.account_id, acct.subject, acct.purpose, new.amount, acct.type
+          using errcode = 'check_violation';
+      end;
+      $$;
+
+      drop trigger if exists balances_no_overdraft on balances;
+      create trigger balances_no_overdraft
+        after insert or update on balances
+        for each row execute function ledger_assert_no_overdraft();
+    `,
+  },
+
+  {
+    version: 8,
+    name: 'idempotency',
+    up: `
+      -- The claim table behind 'withIdempotency'.
+      --
+      -- Distinct from journal_entries.idempotency_key, and both are needed. The unique constraint
+      -- on the entry is the invariant — one key, one entry, for ever. This table is what lets a
+      -- duplicate request be REPLAYED rather than merely refused: it stores the response that was
+      -- committed alongside the postings, so a retry is answered with the original answer instead
+      -- of a 409 the caller cannot act on.
+      --
+      -- The shape is taken from repos/forge-pay/services/pay/src/store.ts:153, which is the best
+      -- code in the existing estate. The behaviour inherited from it, in full:
+      --   * the claim INSERT and the work share ONE transaction, so the stored response can never
+      --     disagree with what actually committed;
+      --   * a concurrent duplicate blocks on the conflicting insert until the original commits,
+      --     then reads the stored response and replays it;
+      --   * a reused key with a different body is a 409, not a silent replay of the wrong answer.
+      create table if not exists idempotency_keys (
+        key          text        primary key,
+        route        text        not null,
+        -- sha256 of the canonicalised request body. A reused key with a changed payload is a
+        -- caller bug that must be reported, not absorbed.
+        request_hash text        not null,
+        -- Null while the claiming transaction is still running. A duplicate that finds null is
+        -- told to retry rather than handed an answer that does not exist yet.
+        response     jsonb,
+        entry_id     uuid        references journal_entries (id),
+        created_at   timestamptz not null default now()
+      );
+
+      -- The reaper's access path.
+      create index if not exists idempotency_keys_created_idx on idempotency_keys (created_at);
+    `,
+  },
+
+  {
+    version: 9,
+    name: 'reconciliation',
+    up: `
+      create table if not exists reconciliation_runs (
+        id                    uuid          primary key default gen_random_uuid(),
+        chain                 text          not null,
+        network               text          not null,
+        asset_code            text          not null,
+        started_at            timestamptz   not null default now(),
+        finished_at           timestamptz,
+        -- Sigma of the custody asset accounts, from the journal.
+        ledger_custody_total  numeric(78,0) not null default 0,
+        -- What the other side of the invariant says. Which side that is depends on
+        -- observed_source, below.
+        indexer_observed_total numeric(78,0) not null default 0,
+        -- ledger_custody_total - indexer_observed_total. POSITIVE means the ledger claims to hold
+        -- coin the other side does not show, and that is the dangerous direction: it is the shape
+        -- of 'convertCoinToEmber' crediting custodial EMBER with no on-chain movement behind it.
+        -- NEGATIVE is an uncredited deposit — still a bug, but one that owes the user rather than
+        -- the reverse. The sign carries the meaning and must not be discarded.
+        drift                 numeric(78,0) not null default 0,
+        status                text          not null default 'failed',
+        -- What the observed side actually was, stated rather than assumed.
+        --
+        --   'liability_sum' — Sigma of user liability accounts, computed from this ledger. This is
+        --                     the internal half of the invariant and is the only half that can be
+        --                     checked today, because the indexer service does not exist yet
+        --                     (00-current-state.md §3.4). It catches a liability minted against no
+        --                     custody position, which is the live 'convertCoinToEmber' defect.
+        --   'indexer'       — Sigma of confirmed on-chain balances the indexer observes. Wired in
+        --                     when AD-07 lands. The column names above are the domain model's and
+        --                     are kept so that the row shape does not change when it does.
+        --
+        -- Recording which comparison was made is the point: a run whose observed side is unstated
+        -- is a run whose green tick means nothing.
+        observed_source       text          not null default 'liability_sum',
+        notes                 text,
+
+        constraint reconciliation_runs_status_chk check (
+          status in ('clean', 'drift_within_tolerance', 'drift_exceeded', 'failed')
+        ),
+        constraint reconciliation_runs_source_chk check (
+          observed_source in ('liability_sum', 'indexer')
+        ),
+        constraint reconciliation_runs_network_chk check (network in ('mainnet', 'testnet'))
+      );
+
+      create index if not exists reconciliation_runs_asset_idx
+        on reconciliation_runs (asset_code, started_at desc);
+
+      -- Exceeding tolerance freezes withdrawals for that asset and pages.
+      --
+      -- A table rather than a config flag, because the freeze must survive a restart and must be
+      -- visible to every replica at once. POST /entries reads it inside the posting transaction
+      -- for withdrawal-kind entries. Nothing like this exists today, and its absence is why a
+      -- reconciliation failure has no mechanical consequence.
+      create table if not exists asset_freezes (
+        asset_code text        primary key,
+        frozen_at  timestamptz not null default now(),
+        reason     text        not null,
+        -- Which run set it, so an operator can read the arithmetic that caused the freeze rather
+        -- than take it on trust.
+        run_id     uuid        references reconciliation_runs (id)
+      );
+    `,
+  },
+
+  {
+    version: 10,
+    name: 'balances_shadow',
+    up: `
+      -- Where the rebuild job replays the journal, so its answer can be compared with the live
+      -- projection side by side in SQL rather than in a log line.
+      --
+      -- **Deliberately carries no overdraft trigger.** The shadow is diagnostic: if replaying the
+      -- journal produces a negative liability, that is the single most important thing the job can
+      -- tell an operator, and a constraint that aborted the rebuild would suppress exactly the
+      -- finding the rebuild exists to surface. Constraints belong on the table that money is
+      -- posted to, not on the table that audits it.
+      --
+      -- No foreign key to accounts for the same reason: a shadow row for an account that has since
+      -- been removed is evidence, not an error to refuse.
+      create table if not exists balances_shadow (
+        account_id  uuid          not null,
+        asset_code  text          not null,
+        amount      numeric(78,0) not null default 0,
+        rebuilt_at  timestamptz   not null default now(),
+        primary key (account_id, asset_code)
+      );
+    `,
+  },
+]
+
+/**
+ * The version this build of the service requires. `index.ts` asserts it at boot and refuses to
+ * serve below it, which is what stops a replica of the new code answering requests against the
+ * old schema when a deploy runs ahead of its migrator.
+ */
+export const SCHEMA_VERSION: number = MIGRATIONS.reduce((max, m) => Math.max(max, m.version), 0)
+
+/**
+ * How an existing hand-built schema is adopted. Zero for a new service.
+ *
+ * The ledger is new — there is nothing to baseline, because the thing it replaces
+ * (00-current-state.md §3.3) is a different table in a different database with a different shape.
+ * Migrating value out of `forge-pay`'s single-sided `ledger` is a data migration with its own
+ * opening-balance entries, not a schema baseline.
+ */
+export const BASELINE_VERSION = 0
