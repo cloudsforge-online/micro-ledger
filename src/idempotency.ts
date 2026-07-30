@@ -57,8 +57,32 @@ export class IdempotencyKeyReuseError extends Error {
  * fingerprint differently and a legitimate retry would be rejected as reuse. Sorting removes a
  * class of false 409 that would be maddening to diagnose from the caller's side.
  */
+/**
+ * Fields that legitimately differ between attempts at the *same* operation, and are therefore
+ * excluded from the fingerprint.
+ *
+ * `correlationId` is the sharp one. It is a trace identifier and it is *supposed* to change on
+ * every attempt — that is what makes a retry distinguishable from the original in a trace. But
+ * including it in the fingerprint means a caller doing exactly the right thing, retrying with a
+ * fresh request id, is told its idempotency key was reused with a different payload. The retry
+ * then fails with 409 and the caller cannot tell a genuine key collision from its own tracing.
+ *
+ * Found by `micro-wallet`, which had to carry a correlation id that was stable per operation
+ * rather than per attempt in order to work around this. That workaround should not have been
+ * necessary and is not, now.
+ */
+const PER_ATTEMPT_FIELDS = new Set(['correlationId'])
+
 export function requestFingerprint(value: unknown): string {
-  return createHash('sha256').update(canonicalise(value)).digest('hex')
+  const subject =
+    value !== null && typeof value === 'object' && !Array.isArray(value)
+      ? Object.fromEntries(
+          Object.entries(value as Record<string, unknown>).filter(
+            ([key]) => !PER_ATTEMPT_FIELDS.has(key),
+          ),
+        )
+      : value
+  return createHash('sha256').update(canonicalise(subject)).digest('hex')
 }
 
 function canonicalise(value: unknown): string {
