@@ -280,6 +280,19 @@ skipped** (`.github/workflows/ci.yml`), which is what stops a green run that pro
 * **No OpenAPI description.** 11-data-and-contract-strategy.md:288 names one as the mechanism for
   generating the SDK; no artefact exists anywhere in the estate, so `@cloudsforge/sdk` is
   hand-written against verified route tables instead (§3.3d, item 1).
+* **`.env.example` and `src/env.ts` disagree on the secret length.** The file says
+  `OUTBOX_SIGNING_SECRET` must be "at least 32 random characters" (`.env.example:19`);
+  `requiredSecret` is called with no length override, so the enforced minimum is the default **24**
+  (`src/env.ts:190`, default at `:55`). The comment is the stricter of the two, so nothing insecure
+  follows — but a 26-character secret satisfies the code and contradicts the file. Found while
+  writing this and **reported rather than edited**, since the remit of that change was this README.
+  `micro-billing`'s `.env.example` carries the identical wording and the identical mismatch.
+* **The example secret would boot.** `OUTBOX_SIGNING_SECRET=CHANGE_ME_TO_32_RANDOM_CHARACTERS`
+  (`.env.example:21`) is 33 characters and is **not** in the `PLACEHOLDERS` set
+  (`src/env.ts:36-45`), so a deployment that copies `.env.example` unchanged starts successfully
+  with a signing secret that is in the repository. The guard catches `changeme` and `change-me` but
+  not this spelling. `micro-indexer` and `micro-mint` ship the variable **empty**, which fails
+  closed and is the better pattern.
 * **`BASELINE_VERSION = 0`** (`src/migrations.ts:631`): there is nothing to adopt. Moving value out
   of `forge-pay`'s single-sided `ledger` is a data migration with its own opening-balance entries,
   not a schema baseline, and it has not been written.
