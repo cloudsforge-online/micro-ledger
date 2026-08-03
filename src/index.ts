@@ -28,6 +28,7 @@ import { SERVICE, env } from './env.ts'
 import { SCHEMA_VERSION } from './migrations.ts'
 import { createServer, registerServiceMetrics } from './server.ts'
 import { registerHandlers, rescheduleRecurring, seedRecurring, type JobDeps } from './jobs.ts'
+import { httpIndexerClient, indexerChainFor } from './indexerclient.ts'
 import { trialBalance } from './entries.ts'
 import { listFreezes } from './reconcile.ts'
 import type { Db } from './outbox.ts'
@@ -131,6 +132,47 @@ const server = createServer({
   },
 })
 
+// 6b. The chain half of the solvency invariant.
+//
+//     ══════════════════════════════════════════════════════════════════════════════════════════
+//     **AN ABSENT INDEXER IS NOT A DISABLED CHECK, IT IS A FAILING ONE**, and this is the only
+//     place in the process that can say so before the first sweep does it fifteen minutes later.
+//     Without a client every `ON_CHAIN_ASSETS` member records `unavailable` / `failed` and freezes
+//     withdrawals; the variable is optional only because `migrator.ts` shares this environment and
+//     `ledger-migrate` is given no indexer (see `env.ts` on `indexerUrl`).
+//
+//     So the condition is logged at boot, at the level its consequence deserves, naming the assets
+//     it will freeze. A configuration whose effect is "this platform stops paying people" must not
+//     be discoverable only by noticing an absence.
+//     ══════════════════════════════════════════════════════════════════════════════════════════
+const chainBackedAssets = env.reconcileAssets.filter((asset) => indexerChainFor(asset) !== undefined)
+const indexer = env.indexerUrl
+  ? httpIndexerClient({
+      baseUrl: env.indexerUrl,
+      // Resolved per call rather than captured, so a future short-TTL credential needs no change
+      // here. Unset today in an estate whose grants have not yet been regenerated from
+      // `INDEXER_SCOPES`; that produces a 401, which produces a freeze, which is failing closed.
+      token: () => env.indexerToken,
+      deadlineMs: env.indexerDeadlineMs,
+      onResult: (event) => {
+        metrics.increment('ledger_indexer_calls_total', { outcome: event.outcome })
+        metrics.observe('ledger_indexer_duration_ms', event.durationMs)
+      },
+    })
+  : undefined
+
+if (!indexer && chainBackedAssets.length > 0) {
+  logger.fatal('NO INDEXER CONFIGURED — every chain-backed asset will freeze on its first sweep', {
+    assets: chainBackedAssets,
+    remedy: 'set INDEXER_URL, or remove these assets from LEDGER_RECONCILE_ASSETS deliberately',
+  })
+} else if (indexer && !env.indexerToken && chainBackedAssets.length > 0) {
+  logger.fatal('NO INDEXER CREDENTIAL — the custody total demands indexer:read, so every chain-backed asset will freeze', {
+    assets: chainBackedAssets,
+    remedy: 'set LEDGER_SERVICE_TOKEN; the grant is derived from INDEXER_SCOPES in src/indexerclient.ts',
+  })
+}
+
 // 7. The job runner, started before `listen()`. Background work is claimed under a lease, so a
 //    replica that is draining stops claiming before it stops serving — `shouldClaim` is wired to
 //    the Lifecycle for exactly that.
@@ -143,6 +185,7 @@ const jobDeps: JobDeps = {
   assetTolerance: env.assetTolerance,
   reconcileAssets: env.reconcileAssets,
   reconcileNetwork: env.reconcileNetwork,
+  indexer,
   idempotencyTtlDays: env.idempotencyTtlDays,
 }
 

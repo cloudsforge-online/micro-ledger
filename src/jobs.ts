@@ -38,6 +38,7 @@ import { type AssetTolerance, type LedgerAssetCode, isChainAsset } from '@clouds
 import { chainSpec } from '@cloudsforge/contracts-chain'
 import { rebuildBalances } from './balances.ts'
 import { reconcileAsset } from './reconcile.ts'
+import { indexerChainFor, type IndexerClient } from './indexerclient.ts'
 import { reapIdempotencyKeys } from './idempotency.ts'
 import { createRelay, type RelayDeps, type Db } from './outbox.ts'
 
@@ -64,6 +65,18 @@ export interface JobDeps {
   readonly assetTolerance: AssetTolerance
   readonly reconcileAssets: readonly LedgerAssetCode[]
   readonly reconcileNetwork: 'mainnet' | 'testnet'
+  /**
+   * Where a chain observation comes from, or `undefined` when this deployment has no indexer
+   * configured.
+   *
+   * **`undefined` is not a disabled check, it is a failing one.** With no client, every chain asset
+   * records `unavailable` / `failed` and freezes — see `env.ts` on `indexerUrl` for why the
+   * variable is optional at all (`ledger-migrate` shares this environment and has no indexer), and
+   * `index.ts` for the boot line that says so out loud. The only way to stop an asset being
+   * checked is to remove it from `LEDGER_RECONCILE_ASSETS`, which is a visible decision in a
+   * deploy manifest.
+   */
+  readonly indexer: IndexerClient | undefined
   readonly idempotencyTtlDays: number
 }
 
@@ -176,38 +189,46 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
    * asset, records the run, and freezes or unfreezes withdrawals accordingly.
    *
    * ══════════════════════════════════════════════════════════════════════════════════════════════
-   * **THIS HANDLER IS WHERE THE INDEXER CALL GOES, AND IT IS THE REASON EVERY CHAIN ASSET NOW
-   * FAILS.** Read this before "fixing" the failures.
+   * **THIS HANDLER IS WHERE THE INDEXER CALL IS MADE. IT IS THE CALL THAT WAS MISSING FOR THE LIFE
+   * OF THE SERVICE**, and the two lines below are the whole of what was wrong with the estate's
+   * solvency guarantee.
    *
-   * `reconcileAsset` takes an optional `indexerObservedTotal` and this call site has never supplied
-   * one — not once, in the life of the service. That is the whole defect: the ternary it fed
-   * silently selected `observed_source = 'liability_sum'`, so the reconciliation guarding "every
-   * EMBER balance is backed by real chain holdings" compared this ledger against this ledger.
-   * `reconcileAsset` no longer falls back for a chain asset, so until the call below exists, EMBER
-   * records `unavailable` / `failed` and stays frozen. **That is the correct state**, and the
-   * argument for it is on `Env.reconcileAssets` in env.ts.
+   * `reconcileAsset` has always taken an optional `indexerObservedTotal`, and this call site never
+   * once supplied one. `grep -rn indexerObservedTotal` over 58 repositories found it passed in
+   * exactly one place: a test. So the ternary it fed silently selected
+   * `observed_source = 'liability_sum'`, and the check guarding "every EMBER balance is backed by
+   * real chain holdings" compared this ledger against this ledger — a check that could not fail, on
+   * the one asset where failing is the point. Worse: `clean` is the status that LIFTS a freeze, and
+   * a vacuous run could always be clean, so such a run would delete a freeze a real observation had
+   * just written.
    *
-   * What `micro-indexer` must expose before this can be wired, stated precisely because the obvious
-   * endpoint is the wrong one:
+   * ## What the call is, and the three things about it that are easy to get wrong
    *
-   *   * **An aggregate, not a per-address read.** It has `watched_addresses (chain, network,
-   *     address)` and per-address routes, but nothing that returns Σ confirmed native balance over
-   *     the custody set. Summing per-address reads HERE would be wrong: this service does not know
-   *     which addresses are custody's, and the set changes under it mid-sweep.
-   *   * **Confirmed only, at the chain's own depth.** `chainSpec(asset).confirmations`, so a
-   *     reorg-eligible block never becomes a drift that freezes withdrawals.
-   *   * **Coverage, and a refusal rather than a partial sum.** This is the one that will get
-   *     written wrong. A total missing one unreadable address is LOW, which reads here as a
-   *     positive drift — "the ledger claims coin the chain does not show" — and freezes the asset
-   *     on the strength of an RPC timeout. The indexer already holds this exact line for token
-   *     balances (`indexer/src/server.ts:479`: "a missing balance is missing, never zero, because
-   *     zero is what evicts a token-gated member"), and the aggregate must hold it too: incomplete
-   *     coverage must leave `indexerObservedTotal` UNDEFINED here, which records `unavailable` and
-   *     `failed`. A partial sum passed off as a total is the same lie this release removed from the
-   *     run row, sourced one service upstream.
+   *   * **It is asked only of an asset that has a chain.** `isOnChainAsset` is `reconcile.ts`'s —
+   *     `ON_CHAIN_ASSETS`, NOT contracts-money's `isChainAsset`, which is true of SHARD because
+   *     SHARD is in `CHAINS` "so the record is total". Asking the indexer about Shards would
+   *     request a slug it refuses by design, and the 404 would come back here as an unobservable
+   *     asset and freeze something that has no chain to be backed by. For SHARD and USD, absence is
+   *     correct and records `liability_sum` — a real check, and the only one those assets can have.
+   *   * **The observation is obtained OUTSIDE the reconciliation transaction, and before it.**
+   *     `reconcileAsset` opens one transaction so both ledger totals are read in a single snapshot;
+   *     an HTTP call inside it would hold that snapshot open for the whole deadline, on the busiest
+   *     tables in the estate. The reading is a fact about the chain a few hundred milliseconds ago
+   *     either way — there is no snapshot that could make it simultaneous — so the honest structure
+   *     is: observe, then reconcile against what was observed.
+   *   * **The conditional spread, not `indexerObservedTotal: observed`.** `exactOptionalPropertyTypes`
+   *     aside, an explicitly-present `undefined` and an absent key are the same to `reconcileAsset`;
+   *     writing it this way makes the absence a decision at the call site rather than a value that
+   *     happened to be undefined.
    *
-   * `micro-deploy` then owns the URL and the timeout. A missing or unreachable indexer must reach
-   * `reconcileAsset` as `undefined` — never as `0n`, which asserts an empty chain.
+   * ## The failure mode is the feature. Do not add a fallback.
+   *
+   * `observedTotalFor` returns `undefined` for every non-answer — a timeout, a refused connection,
+   * a 401 from a missing grant, a 503 from a halted chain, a body that is not a decimal string, and
+   * a `0` that arrived as a JSON number. Every one of those records `unavailable` / `failed`, which
+   * freezes the asset and which no later unobserved run can lift. **The gap fails closed.** A
+   * cached previous total, a retry loop, a `?? 0n`, or an `if (asset === 'EMBER')` would each turn
+   * it back into a check that cannot fail. `indexerclient.ts` carries the argument in full.
    * ══════════════════════════════════════════════════════════════════════════════════════════════
    */
   runner.register<{ assetCode?: string; network?: string }>(RECONCILE_KIND, async (job) => {
@@ -218,13 +239,26 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
       throw new Error(`${RECONCILE_KIND} requires a string assetCode`)
     }
     const network = job.payload.network === 'mainnet' ? 'mainnet' : 'testnet'
+    const asset = assetCode as LedgerAssetCode
+
+    // `indexerChainFor` is derived from `ON_CHAIN_ASSETS`, which is the same list `reconcileAsset`
+    // consults to decide that an unobserved asset is a failure rather than a `liability_sum`. That
+    // the two agree is not left to inspection: `indexerclient.test.ts` asserts a slug exists for
+    // exactly the assets `isOnChainAsset` accepts, so neither can drift into the other's blind
+    // spot — an asset
+    // this handler skips but `reconcileAsset` demands a reading for would freeze for ever with no
+    // call ever having been attempted.
+    const chainSlug = indexerChainFor(asset)
+    const observed =
+      chainSlug === undefined ? undefined : await deps.indexer?.observedTotalFor(chainSlug, network)
 
     const result = await reconcileAsset(deps.sql, {
-      assetCode: assetCode as LedgerAssetCode,
-      chain: chainNameFor(assetCode as LedgerAssetCode),
+      assetCode: asset,
+      chain: chainNameFor(asset),
       network,
       tolerance: deps.assetTolerance,
       producer: deps.producer,
+      ...(observed === undefined ? {} : { indexerObservedTotal: observed }),
     })
 
     // **`Number(null)` is `0`.** This line read `Number(result.drift)` unconditionally, and now that

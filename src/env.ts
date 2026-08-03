@@ -70,6 +70,34 @@ function optional(source: Source, name: string, fallback: string): string {
   return value && value.length > 0 ? value : fallback
 }
 
+/** Absent is a supported mode; present-but-rubbish is not. */
+function optionalSecret(source: Source, name: string, minLength = 24): string | undefined {
+  const value = source[name]?.trim()
+  if (!value) return undefined
+  return requiredSecret(source, name, minLength)
+}
+
+/**
+ * An absolute `http://` or `https://` origin, or nothing.
+ *
+ * Parsed rather than pattern-matched, so `INDEXER_URL=indexer:4000` — which `fetch` would treat as
+ * a relative path and fail on at the fifteen-minute mark rather than at boot — names itself here.
+ */
+function optionalUrl(source: Source, name: string): string | undefined {
+  const value = source[name]?.trim()
+  if (!value) return undefined
+  let parsed: URL
+  try {
+    parsed = new URL(value)
+  } catch {
+    throw new EnvError(`${name} must be an absolute URL (got ${value})`)
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new EnvError(`${name} must be http or https (got ${parsed.protocol})`)
+  }
+  return value.replace(/\/+$/, '')
+}
+
 function integer(source: Source, name: string, fallback: number, min: number, max: number): number {
   const raw = source[name]?.trim()
   if (!raw) return fallback
@@ -181,6 +209,56 @@ export interface Env {
   readonly reconcileAssets: readonly LedgerAssetCode[]
   readonly reconcileNetwork: 'mainnet' | 'testnet'
   /**
+   * Where the chain half of the solvency invariant is read from —
+   * `GET /v1/custody/:chain/:network/total` on `micro-indexer`.
+   *
+   * ════════════════════════════════════════════════════════════════════════════════════════════
+   * **OPTIONAL, AND THAT IS A DECISION WITH A REASON THAT IS NOT "IT SEEMED SAFER".**
+   *
+   * The obvious design is to demand it whenever `reconcileAssets` names an `ON_CHAIN_ASSETS`
+   * member — the configuration is incoherent without it, and "a missing variable names itself" is
+   * this file's first principle. **It would kill the estate.** `src/migrator.ts` imports this
+   * module, so `ledger-migrate` — the one-shot container every other ledger container waits on
+   * (`docker-compose.estate.yml:474`) — validates this environment too, and it is given
+   * `LEDGER_DATABASE_URL` and `OUTBOX_SIGNING_SECRET` and nothing else (`:388-397`). It does not
+   * set `LEDGER_RECONCILE_ASSETS` either, so it would inherit the `SHARD,EMBER` default, demand an
+   * indexer it has no business calling, exit 1, and take the estate's schema with it. That is the
+   * same class of failure as the literal cross-repo import that broke `indexer-migrate`: found by
+   * running the thing, not by reading it.
+   *
+   * Absence is safe in the only direction that counts. No URL means no client, which means no
+   * observation, which for a chain asset is `unavailable` / `failed` — the asset freezes and stays
+   * frozen. A misconfigured deploy stops withdrawals rather than quietly reporting a number, and
+   * `index.ts` logs the condition at boot so it is a line an operator sees rather than a silence.
+   * ════════════════════════════════════════════════════════════════════════════════════════════
+   */
+  readonly indexerUrl: string | undefined
+  /**
+   * Absolute wall-clock ceiling on the custody-total call, across connect and body.
+   *
+   * It is a ceiling on a JOB'S LEASE as much as on a request. The reconciliation job holds its
+   * lease for the whole handler, so a provider holding the socket open holds the lease with it,
+   * and the asset's next run cannot be claimed until it drops. Five seconds is the deploy's value
+   * and the default here; the ceiling is 60s because anything beyond that is a stuck job wearing a
+   * timeout's clothes.
+   */
+  readonly indexerDeadlineMs: number
+  /**
+   * The credential presented to the indexer. **Optional, and unset is a supported mode.**
+   *
+   * The custody route is the one read on that service demanding `indexer:read`, and this service
+   * is granted it only once `derive-grants.mjs` has read `INDEXER_SCOPES` out of
+   * `src/indexerclient.ts` and regenerated `IDENTITY_SERVICE_TOKEN_GRANTS`. Between those two
+   * events a deployment has the URL and no token, and the honest behaviour is to make the call,
+   * get a 401, map it to no observation, and freeze — which is exactly what happens. Refusing to
+   * boot instead would trade a frozen asset for a dead ledger, and the ledger is what serves every
+   * balance in the estate.
+   *
+   * Checked for placeholders and length when it IS set, like every other secret here, so the mode
+   * that is supported is "absent" rather than "absent or rubbish".
+   */
+  readonly indexerToken: string | undefined
+  /**
    * How long an idempotency key is honoured. Expiring one EARLY means the next replay of it does
    * the work a second time, so the TTL must outlive every caller's retry horizon rather than be
    * as short as the table would like.
@@ -227,6 +305,9 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     assetTolerance: parseAssetTolerance(optional(source, 'LEDGER_ASSET_TOLERANCE', '{}')),
     reconcileAssets: assets as readonly LedgerAssetCode[],
     reconcileNetwork: network,
+    indexerUrl: optionalUrl(source, 'INDEXER_URL'),
+    indexerDeadlineMs: integer(source, 'LEDGER_INDEXER_DEADLINE_MS', 5_000, 100, 60_000),
+    indexerToken: optionalSecret(source, 'LEDGER_SERVICE_TOKEN'),
     idempotencyTtlDays: integer(source, 'LEDGER_IDEMPOTENCY_TTL_DAYS', 30, 1, 3_650),
   }
 }

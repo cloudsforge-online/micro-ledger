@@ -76,7 +76,7 @@ import { withOutbox, type Db, type Tx } from './outbox.ts'
  * total". Using it here would demand an indexer feed for Shards, which have no chain to feed from,
  * and the mistake would look exactly like a working guard.
  */
-function isOnChainAsset(assetCode: LedgerAssetCode): boolean {
+export function isOnChainAsset(assetCode: LedgerAssetCode): boolean {
   return (ON_CHAIN_ASSETS as readonly string[]).includes(assetCode)
 }
 
