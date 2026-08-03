@@ -6,6 +6,13 @@ invariant stop agreeing. It is the financial source of truth, and it is delibera
 product writes to directly — every posting arrives through a typed API from a service that holds a
 service token, never from a browser.
 
+> **A reconciliation of an on-chain asset can no longer pass without a chain observation.** The
+> books summing to zero does not make them true — books can be perfectly consistent about a claim on
+> something that is not there. Migration 11 refuses `observed_source = 'liability_sum'` for any asset
+> that lives on a chain, and records a run with no reading as `unavailable` / `failed`, which freezes
+> the asset and can never unfreeze it. See **Known gaps** for what this currently costs (EMBER) and
+> for the part no schema can do (verify the reading itself).
+
 > **Nothing in this service is reachable by a user.** `authorise()` refuses any principal whose
 > `kind` is not `service`, before the scope check and for every domain route
 > (`src/server.ts:575`). A user token presented to `GET /accounts/:subject/balances` gets the same
@@ -134,9 +141,17 @@ attempt budget is a ledger that has stopped being checked (`src/jobs.ts:119-122`
 
 `jobs`, `outbox`, `event_subscriptions`, `outbox_deliveries`, `inbox`, `accounts`,
 `journal_entries`, `postings`, `balances`, `idempotency_keys`, `reconciliation_runs`,
-`asset_freezes`, `balances_shadow` — versioned migrations 1–10 in `src/migrations.ts`, run only by
-`src/migrator.ts`. `index.ts` asserts the version and refuses to serve below it
-(`src/index.ts:67`).
+`asset_freezes`, `balances_shadow`, `chain_assets` — versioned migrations 1–11 in
+`src/migrations.ts`, run only by `src/migrator.ts`. `index.ts` asserts the version and refuses to
+serve below it (`src/index.ts:67`).
+
+`chain_assets` is reference data, not state: the five codes in `ON_CHAIN_ASSETS`
+(`contracts/packages/chain/src/index.ts:123`), seeded by migration 11 so that a constraint can read
+them — a `CHECK` cannot reference another table, and interpolating the list into the migration text
+would change an **applied** migration's checksum the day a sixth asset is added and stop every
+deployment booting. `reconcile.test.ts` asserts the table equals `ON_CHAIN_ASSETS`, and
+`testsupport.ts` deliberately excludes it from the truncate list — emptying it would silently
+disarm the guard below and turn the whole suite green.
 
 `src/migrations.ts:12-34` states the design plainly: 04-domain-model.md §2.2 requires these
 invariants "in the database, not in application code", because the thing this replaces —
@@ -155,7 +170,10 @@ in whichever route happened to write the row. **A rule in a route is a rule the 
 | `postings_amount_positive_chk` | amount ≤ 0 | direction carries the sign. A signed amount plus a direction is two ways to say one thing and they drift (`src/migrations.ts:227`) |
 | `postings_entry_sequence_uniq` | two postings at one sequence in one entry | replay order is the journal's order; a duplicate sequence makes a rebuild non-deterministic (`src/migrations.ts:231`) |
 | `accounts_key_uniq` on `(subject, asset_code, purpose)` | a second account for one key | the account key *is* those three columns; a duplicate splits one balance in two (`src/migrations.ts:142`) |
-| `reconciliation_runs_source_chk` | an `observed_source` outside `liability_sum` \| `indexer` | **a run whose observed side is unstated is a run whose green tick means nothing** (`src/migrations.ts:564`, reasoning at `:556-557`) |
+| `reconciliation_runs_source_chk` | an `observed_source` outside `liability_sum` \| `indexer` \| `unavailable` | **a run whose observed side is unstated is a run whose green tick means nothing.** `unavailable` was added in migration 11 so that "nobody could observe this asset" is a statable outcome rather than one that has to be disguised as a comparison |
+| `reconciliation_runs_chain_observation_trg` (trigger) | `observed_source = 'liability_sum'` for any asset in `chain_assets` | **the check that could not fail.** `liability_sum` compares Σ custody against Σ liabilities *from this same ledger*; a fabricated deposit moves both sides at once, so the books balance perfectly about coin that does not exist. For an asset that lives on a chain, only the chain can settle the question. A trigger rather than a `CHECK` because it must read `chain_assets`; it raises `23514` so callers cannot tell it from one |
+| `reconciliation_runs_unobserved_failed_chk` | `observed_source = 'unavailable'` with any status but `failed` | **absence of evidence is not evidence.** `freezesWithdrawals('failed')` is true and only an exactly-`clean` run lifts a freeze, so this one line is what makes an unobservable asset an unwithdrawable one — and what stops such a run *lifting* a freeze a real observation set |
+| `reconciliation_runs_unobserved_chk` / `_drift_chk` | a stated total or drift with no observation behind it, and the mirror | `indexer_observed_total` and `drift` were `not null default 0`, so "we did not look" was written down as "the chain holds nothing" — the most reassuring number available for the least reassuring state. Migration 11 drops both defaults so `NULL` means unknown, and these two pin the columns to each other in both directions |
 | `balances_shadow` carries **no** overdraft trigger and **no** FK | — | deliberate. The shadow is diagnostic: if replaying the journal produces a negative liability that is the single most important thing the job can report, and a constraint aborting the rebuild would suppress exactly the finding the rebuild exists to surface (`src/migrations.ts:597-604`) |
 
 `balances.amount` is held in the account's own **normal** direction, so the number reads as "how
@@ -167,6 +185,14 @@ overdraft trigger exists to refuse (`src/migrations.ts:400-405`).
 carries the meaning**: positive means the ledger claims coin the other side does not show — the
 shape of a liability minted against no custody position — and negative is an uncredited deposit,
 still a bug but one that owes the user rather than the reverse (`src/migrations.ts:538-542`).
+
+**And its absence carries meaning too.** Since migration 11 both `drift` and `indexer_observed_total`
+are nullable, and `NULL` means *nobody observed*, which is not the same fact as *no difference*. The
+same distinction is kept on the wire — `ledger.reconciliation.completed` carries `drift: null` rather
+than `"0"` — and in metrics, where a gauge cannot express "unknown" at all: `ledger_reconciliation_drift`
+is left **unwritten** for an unobserved run and `ledger_reconciliation_observed` (`0`/`1`, per asset)
+is what says whether to believe it. Writing `Number(result.drift)` there would publish `0`, because
+`Number(null)` is `0` — the most reassuring number available for the least reassuring state.
 
 ---
 
@@ -190,7 +216,7 @@ test-only knob. A known placeholder value is refused at boot rather than accepte
 | `OUTBOX_SIGNING_SECRET` | — | **required**, ≥24 chars, placeholders refused. Wrong → subscribers cannot verify an event came from us; changing it invalidates in-flight signatures (`src/env.ts:190`) |
 | `INSTANCE_ID` | hostname | names this replica in `jobs.locked_by`; wrong only makes a stuck lease harder to attribute (`src/env.ts:191`) |
 | `LEDGER_ASSET_TOLERANCE` | `{}` | JSON of asset → smallest-unit string. **An asset absent from the map gets zero tolerance, not infinity** — `withinTolerance` fails closed and this parser must not undo that (`src/env.ts:95`, reasoning at `:83-93`). Set too high and drift stops freezing withdrawals |
-| `LEDGER_RECONCILE_ASSETS` | `SHARD,EMBER` | the list actually swept. An asset omitted here is **never reconciled** — explicit rather than derived from `accounts` so an operator can read the list without inferring it from data (`src/env.ts:173`, reasoning at `:139-145`) |
+| `LEDGER_RECONCILE_ASSETS` | `SHARD,EMBER` | the list actually swept. An asset omitted here is **never reconciled** — explicit rather than derived from `accounts` so an operator can read the list without inferring it from data. **The default includes EMBER, and EMBER fails every run and freezes withdrawals until `micro-indexer` supplies an aggregate**: it is in `ON_CHAIN_ASSETS`, Hearth's mainnet has not launched, and an asset nobody can observe is one nobody should be able to withdraw. Removing it here is the *only* supported exemption, because it makes the asset stop being checked rather than making it look checked (`src/env.ts`, argument on `Env.reconcileAssets`) |
 | `LEDGER_RECONCILE_NETWORK` | `testnet` | must be `mainnet` or `testnet`; recorded on every run row (`src/env.ts:168`) |
 | `LEDGER_IDEMPOTENCY_TTL_DAYS` | `30` | **expiring a key early means the next replay does the work a second time**, so this must outlive every caller's retry horizon rather than be as short as the table would like (`src/env.ts:195`, reasoning at `:148-152`) |
 | `LEDGER_TEST_DATABASE_URL` | — | tests only. Unset, every database-backed test **skips**; the database name must contain `test` because the suite truncates |
@@ -254,15 +280,34 @@ skipped** (`.github/workflows/ci.yml`), which is what stops a green run that pro
 
 ## Known gaps
 
-* **Reconciliation only ever checks the internal half of the invariant.** `reconcileAsset` records
-  `observed_source = 'indexer'` when it is handed an `indexerObservedTotal` and `'liability_sum'`
-  otherwise (`src/reconcile.ts:101`), and the job **never passes one** — it calls with `assetCode`,
-  `chain`, `network` and `tolerance` only (`src/jobs.ts:180-185`). So in production every run
-  compares Σ custody accounts against Σ liability accounts *from this same ledger*. That catches a
-  liability minted against no custody position, which is the live `convertCoinToEmber` defect
-  (`src/reconcile.ts:16-21`), and it catches **nothing** about whether the chain actually holds the
-  coin. Wiring `micro-indexer` in adds a caller, not a migration — the column shape is already the
-  domain model's (`src/migrations.ts:552-554`).
+* **Reconciliation cannot silently check only the internal half any more — but nothing supplies the
+  external half yet, so every chain asset now FAILS and freezes.** This bullet used to describe the
+  gap as benign and it was not. `reconcileAsset` selected `'liability_sum'` whenever no
+  `indexerObservedTotal` was passed, and **no production caller ever passed one**, so every run in
+  the service's life compared this ledger against itself. Worse than vacuous: `clean` is the status
+  that *lifts* a freeze, so a `liability_sum` run would delete a freeze an indexer-backed run had
+  just set — the check that could not fail also outranked the one that could.
+
+  Migration 11 makes `liability_sum` illegal for any asset in `chain_assets`, and a chain asset with
+  no reading now records `observed_source = 'unavailable'`, `NULL` totals and `status = 'failed'`.
+  The mechanism is landed and proved; the **feed is not**. Until `micro-indexer` exposes an
+  aggregate, EMBER fails every run and stays frozen. That is deliberate — the argument is on
+  `Env.reconcileAssets` (`src/env.ts`) and the operator lever is `LEDGER_RECONCILE_ASSETS`, not a
+  code exemption.
+
+  This bullet also asserted that wiring `micro-indexer` in "adds a caller, not a migration". **That
+  was wrong**, and it is worth recording why: the run shape was indeed already the domain model's,
+  but the *constraint* was not — the schema permitted the vacuous answer, and no caller can fix a
+  schema that accepts a lie. It took a migration.
+
+* **Nothing verifies the observation itself, and no schema can.** `indexer_observed_total` is an
+  assertion by whoever called the job. A caller that fabricates one is indistinguishable, in this
+  database, from one that read a chain. The constraints above refuse a run that never *had*
+  evidence; they cannot audit evidence they are handed. The requirements this puts on
+  `micro-indexer` — confirmed-only at `chainSpec(asset).confirmations`, and **incomplete coverage
+  must refuse rather than return a partial sum**, because a low total reads here as a positive drift
+  and freezes withdrawals on an RPC timeout — are written out at `src/jobs.ts` on the reconcile
+  handler.
 * **`/metrics` is unauthenticated** (`src/server.ts:331`). `micro-beacon` gates its equivalent and
   presents a token from Prometheus; this service does not, so anything that can reach the port can
   read `ledger_trial_balance_delta`, `ledger_reconciliation_drift` and the per-service posting

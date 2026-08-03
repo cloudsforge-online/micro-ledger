@@ -12,13 +12,39 @@
  * shows up here as a **positive** drift: the ledger believes we hold coin the other side does not
  * show.
  *
- * Two halves of the invariant, and only one of them can be checked today:
+ * Two halves of the invariant:
  *
- *   * **liability vs custody** — internal, checkable now, and the half that catches
- *     `convertCoinToEmber`. This is what `observed_source = 'liability_sum'` records.
- *   * **custody vs chain** — needs the indexer service, which does not exist yet
- *     (00-current-state.md §3.4, AD-07). The column names and the run shape are the domain
- *     model's, so wiring the indexer in later adds a caller, not a migration.
+ *   * **liability vs custody** — internal, and the half that catches `convertCoinToEmber`. This is
+ *     what `observed_source = 'liability_sum'` records. It is a real check, and for an asset with
+ *     no chain behind it (SHARD, USD) it is the only one available.
+ *   * **custody vs chain** — the half that makes the economics valid FROM CHAIN, and the only half
+ *     that means anything for an asset that lives on one.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THE SECOND HALF WAS NEVER ONCE CHECKED, AND THE FIRST HALF WAS STANDING IN FOR IT.**
+ *
+ * The comment that used to sit here said the indexer "does not exist yet", and when it was written
+ * that was true. It stopped being true — `micro-indexer` has Bitcoin, Solana and EVM families with
+ * reorg handling — and nothing here changed. `indexerObservedTotal` stayed optional, and
+ * `grep -rn indexerObservedTotal ledger/src` found it supplied in exactly one place in the whole
+ * estate: a test. `jobs.ts` — the scheduled sweep, the only production caller — never passed it.
+ *
+ * So every run this service ever made on EMBER compared the ledger against the ledger and reported
+ * clean. A fabricated deposit moves custody and liability together, so the books balance perfectly
+ * about coin that does not exist; and because `clean` is the status that LIFTS a withdrawal freeze,
+ * a vacuous run would delete a freeze a real observation had just set. The check that could not
+ * fail also outranked the one that could.
+ *
+ * `reconcileAsset` no longer falls back. A chain asset with no reading records
+ * `observed_source = 'unavailable'`, a NULL observed total, a NULL drift and `status = 'failed'` —
+ * which freezes the asset and can never unfreeze it. Migration 11 makes all of that the schema's
+ * rule rather than this function's, because a handler-only guard is bypassable by a bug, a
+ * migration, or an operator with a psql connection.
+ *
+ * What no schema can do is verify the reading. `indexer_observed_total` is an assertion by the
+ * caller, and a caller determined to fabricate one still can. That is the honest boundary: the
+ * database can refuse a run that never had evidence, and it cannot audit evidence it is handed.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
  *
  * The arithmetic — `computeDrift`, `withinTolerance`, `reconciliationStatus`,
  * `freezesWithdrawals` — is `@cloudsforge/contracts-money` and is not restated here. In particular
@@ -34,7 +60,25 @@ import {
   freezesWithdrawals,
   reconciliationStatus,
 } from '@cloudsforge/contracts-money'
+import { ON_CHAIN_ASSETS } from '@cloudsforge/contracts-chain'
 import { withOutbox, type Db, type Tx } from './outbox.ts'
+
+/**
+ * Is this asset settled on a chain, and therefore only ever attestable BY a chain?
+ *
+ * `ON_CHAIN_ASSETS` (contracts/packages/chain/src/index.ts:123) is the estate's declaration and is
+ * read here rather than restated. The `chain_assets` table migration 11 seeds is the same list in
+ * the one other place that needs it — the database, which cannot import TypeScript — and
+ * `reconcile.test.ts` asserts the two are equal so neither can drift in silence.
+ *
+ * **Not `isChainAsset` from contracts-money.** That function is `Object.hasOwn(CHAINS, code)`, and
+ * `CHAINS` contains SHARD — carried with the comment "never used on chain; present so the record is
+ * total". Using it here would demand an indexer feed for Shards, which have no chain to feed from,
+ * and the mistake would look exactly like a working guard.
+ */
+function isOnChainAsset(assetCode: LedgerAssetCode): boolean {
+  return (ON_CHAIN_ASSETS as readonly string[]).includes(assetCode)
+}
 
 /**
  * The topic a finished reconciliation announces itself on.
@@ -92,12 +136,27 @@ export interface ReconcileInput {
   /**
    * The observed total, when something outside the ledger can supply one.
    *
-   * Absent — the run compares Σ custody assets against Σ user liabilities, both from this ledger,
-   * and records `observed_source = 'liability_sum'`. Present — it is the indexer's confirmed
-   * on-chain total and the run records `observed_source = 'indexer'`.
+   * **Present** — it is the indexer's confirmed on-chain total; `observed_source = 'indexer'`.
+   *
+   * **Absent, and the asset is NOT chain-backed** (SHARD, USD) — the run compares Σ custody assets
+   * against Σ user liabilities, both from this ledger, and records `liability_sum`. That is the
+   * only check those assets can have and it is a real one: it catches a liability credited against
+   * no custody position.
+   *
+   * **Absent, and the asset IS chain-backed** — the run records `unavailable` and `failed`. It does
+   * not fall back to the ledger's own books, because a check of a chain asset that never looked at
+   * a chain is not a weaker check, it is a different question wearing the answer's clothes.
    */
   readonly indexerObservedTotal?: bigint
 }
+
+/**
+ * Where the observed side of the comparison came from.
+ *
+ * `'unavailable'` is not an error code — the run happened, and the fact it establishes is "nobody
+ * could observe this asset", which is itself worth recording and acting on.
+ */
+export type ObservedSource = 'liability_sum' | 'indexer' | 'unavailable'
 
 export interface ReconciliationResult {
   readonly id: string
@@ -105,11 +164,16 @@ export interface ReconciliationResult {
   readonly chain: string
   readonly network: string
   readonly ledgerCustodyTotal: string
-  readonly indexerObservedTotal: string
-  /** Ledger minus observed. **The sign carries the meaning and must not be discarded.** */
-  readonly drift: string
+  /** `null` when nothing observed. **Never `'0'`** — a zero here would read as a measurement. */
+  readonly indexerObservedTotal: string | null
+  /**
+   * Ledger minus observed. **The sign carries the meaning and must not be discarded**, and neither
+   * must its absence: `null` means there was no second number to subtract, not that there was no
+   * difference.
+   */
+  readonly drift: string | null
   readonly status: ReconciliationStatus
-  readonly observedSource: 'liability_sum' | 'indexer'
+  readonly observedSource: ObservedSource
   readonly froze: boolean
   readonly unfroze: boolean
 }
@@ -160,12 +224,41 @@ export async function reconcileAsset(sql: Db, input: ReconcileInput): Promise<Re
   return withOutbox(sql, input.producer, async (tx, emit) => {
     const custodyTotal = await totalFor(tx, 'asset', input.assetCode, 'custody')
 
-    const observedSource = input.indexerObservedTotal !== undefined ? 'indexer' : 'liability_sum'
-    const observedTotal =
-      input.indexerObservedTotal ?? (await totalFor(tx, 'liability', input.assetCode))
+    /**
+     * **The three-way choice this whole commit is about.**
+     *
+     * It was a ternary — `indexerObservedTotal !== undefined ? 'indexer' : 'liability_sum'` — and
+     * no production caller ever took the first branch, so the reconciliation guarding "every EMBER
+     * balance is backed by real chain holdings" compared the ledger against itself, forever,
+     * unfailingly, on the one asset where that means least.
+     *
+     * The middle case is the new one and it is the point: a chain asset with no reading is a
+     * FAILURE, not a fallback. `freezesWithdrawals('failed')` is true, so the asset freezes; and
+     * since only `status === 'clean'` lifts a freeze and an unobserved run can never be clean, such
+     * a run can never release one either. Both consequences are correct — an asset whose backing
+     * nobody can see is an asset nobody should be able to withdraw.
+     */
+    let observedSource: ObservedSource
+    let observedTotal: bigint | null
+    if (input.indexerObservedTotal !== undefined) {
+      observedSource = 'indexer'
+      observedTotal = input.indexerObservedTotal
+    } else if (isOnChainAsset(input.assetCode)) {
+      observedSource = 'unavailable'
+      observedTotal = null
+    } else {
+      observedSource = 'liability_sum'
+      observedTotal = await totalFor(tx, 'liability', input.assetCode)
+    }
 
-    const drift = computeDrift(custodyTotal, observedTotal)
-    const status = reconciliationStatus({ assetCode: input.assetCode, drift }, input.tolerance)
+    // `null`, never `0n`. `computeDrift(custodyTotal, 0n)` would state that the chain holds nothing
+    // — a measurement — where the truth is that nobody measured. The schema refuses the lie too
+    // (`reconciliation_runs_drift_chk`), so this cannot be undone here by a later edit.
+    const drift = observedTotal === null ? null : computeDrift(custodyTotal, observedTotal)
+    const status: ReconciliationStatus =
+      drift === null
+        ? 'failed'
+        : reconciliationStatus({ assetCode: input.assetCode, drift }, input.tolerance)
 
     const runRows = await tx<{ id: string }[]>`
       insert into reconciliation_runs (
@@ -174,8 +267,8 @@ export async function reconcileAsset(sql: Db, input: ReconcileInput): Promise<Re
       ) values (
         ${input.chain}, ${input.network}, ${input.assetCode}, now(),
         ${custodyTotal.toString()}::numeric(78,0),
-        ${observedTotal.toString()}::numeric(78,0),
-        ${drift.toString()}::numeric(78,0),
+        ${observedTotal === null ? null : observedTotal.toString()}::numeric(78,0),
+        ${drift === null ? null : drift.toString()}::numeric(78,0),
         ${status}, ${observedSource}
       )
       returning id
@@ -186,16 +279,27 @@ export async function reconcileAsset(sql: Db, input: ReconcileInput): Promise<Re
     let unfroze = false
 
     if (freezesWithdrawals(status)) {
+      // The reason an operator reads first, and the two cases say genuinely different things. A
+      // drift is arithmetic they can check. An unavailable observation is not a small drift and
+      // must not be phrased as one — there is no number, and printing "drift 0" beside a freeze
+      // would send them looking for a discrepancy that was never measured.
+      //
+      // Discriminated on `observedTotal`, which is the value actually interpolated, rather than on
+      // `drift`. The two are null together by construction and the schema enforces it, but narrowing
+      // on one to dereference the other needs a `!` that would survive a future edit breaking the
+      // pairing. Narrowing on the thing being read needs no assertion at all.
+      const reason =
+        observedTotal === null
+          ? `reconciliation failed: no indexer observation for on-chain asset ${input.assetCode}` +
+            ` (custody ${custodyTotal.toString()}; chain holdings UNKNOWN, not zero)`
+          : `reconciliation ${status}: drift ${String(drift)} (custody ${custodyTotal.toString()}, observed ${observedTotal.toString()})`
+
       // `on conflict do update` rather than `do nothing`: a still-drifting asset must carry the
       // reason and run id of the LATEST run, or an operator reads the arithmetic of a run that has
       // since been superseded.
       await tx`
         insert into asset_freezes (asset_code, reason, run_id)
-        values (
-          ${input.assetCode},
-          ${`reconciliation ${status}: drift ${drift.toString()} (custody ${custodyTotal.toString()}, observed ${observedTotal.toString()})`},
-          ${runId}
-        )
+        values (${input.assetCode}, ${reason}, ${runId})
         on conflict (asset_code) do update
           set reason = excluded.reason, run_id = excluded.run_id, frozen_at = now()
       `
@@ -215,8 +319,8 @@ export async function reconcileAsset(sql: Db, input: ReconcileInput): Promise<Re
       chain: input.chain,
       network: input.network,
       ledgerCustodyTotal: custodyTotal.toString(),
-      indexerObservedTotal: observedTotal.toString(),
-      drift: drift.toString(),
+      indexerObservedTotal: observedTotal === null ? null : observedTotal.toString(),
+      drift: drift === null ? null : drift.toString(),
       status,
       observedSource,
       froze,
@@ -236,6 +340,13 @@ export async function reconcileAsset(sql: Db, input: ReconcileInput): Promise<Re
       // reconciliation by different amounts invents the exact drift this job exists to detect.
       // `activity/src/classify.ts:341` reads `drift` through its `amount()` reader, which takes a
       // string.
+      //
+      // **`drift` and `indexerObservedTotal` are now `string | null`, and null is deliberate on the
+      // wire.** A consumer must be able to tell "no difference" from "no observation"; sending 0 for
+      // both is the defect this commit removes, re-committed one layer out. `amount()` at
+      // `activity/src/classify.ts:94` requires `typeof value === 'string'` and returns null
+      // otherwise, so its summary already degrades to "Reconciliation completed." rather than
+      // announcing a drift of zero that nobody measured — checked, not assumed.
       payload: {
         runId,
         assetCode: result.assetCode,
@@ -294,8 +405,9 @@ export interface ReconciliationRunView {
   readonly startedAt: string
   readonly finishedAt: string | null
   readonly ledgerCustodyTotal: string
-  readonly indexerObservedTotal: string
-  readonly drift: string
+  /** `null` when the run observed nothing. Distinguishable from an observed zero, on purpose. */
+  readonly indexerObservedTotal: string | null
+  readonly drift: string | null
   readonly status: ReconciliationStatus
   readonly observedSource: string
 }
@@ -311,8 +423,8 @@ export async function latestRuns(sql: Db): Promise<ReconciliationRunView[]> {
       started_at: Date
       finished_at: Date | null
       ledger_custody_total: string
-      indexer_observed_total: string
-      drift: string
+      indexer_observed_total: string | null
+      drift: string | null
       status: string
       observed_source: string
     }[]

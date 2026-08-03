@@ -22,6 +22,7 @@ import { AssetFrozenError, postEntry, type PostEntryDeps } from './entries.ts'
 import { requestFingerprint } from './idempotency.ts'
 import { RECONCILIATION_COMPLETED, listFreezes, latestRuns, reconcileAsset } from './reconcile.ts'
 import { topicSpec } from '@cloudsforge/contracts-events'
+import { ON_CHAIN_ASSETS } from '@cloudsforge/contracts-chain'
 import { KEYED_BY, envelopeDefects } from './topics.ts'
 import {
   ALICE,
@@ -91,6 +92,91 @@ async function mintUnbackedLiability(amount: bigint): Promise<void> {
     ],
   })
 }
+
+/* ========================================================= the vacuous path (DEFECT) */
+
+/**
+ * **THE FINDING THIS COMMIT EXISTS FOR, WRITTEN AS A TEST THAT PASSED BEFORE IT.**
+ *
+ * `docs/ecosystem/00-current-state.md:22` records the sin the estate is migrating away from:
+ * "Custodial EMBER can be minted with no chain movement." The owner's decision is that the
+ * economics of the ecosystem must be **valid from chain**.
+ *
+ * The check that was supposed to hold that property could not fail. `reconcile.ts:163` read
+ *
+ *     observedSource = input.indexerObservedTotal !== undefined ? 'indexer' : 'liability_sum'
+ *
+ * and NO CALLER EVER SUPPLIED ONE. `jobs.ts:187` — the scheduled sweep, the only production
+ * caller in the estate — passed `assetCode`, `chain`, `network`, `tolerance` and `producer`, and
+ * nothing else. `grep -rn indexerObservedTotal ledger/src` found it set in exactly one place: a
+ * test. So **every reconciliation this service has ever run in anger took the `liability_sum`
+ * branch**, on EMBER as much as on SHARD.
+ *
+ * That branch is not useless — it catches `convertCoinToEmber`, a liability credited against no
+ * custody position, and the test below it still proves that. But it is an INTERNAL identity: it
+ * asks the ledger whether the ledger agrees with itself. It cannot see a chain, and the deposit
+ * fabricated here moves BOTH sides at once, so the books balance perfectly about coin that does
+ * not exist.
+ *
+ * The test asserts the same ledger state twice and gets two opposite verdicts. That is the whole
+ * proof: if a verdict flips on evidence the run never demanded, the verdict was worth nothing.
+ *
+ * ## Worse than "proves nothing": it ERASED a true finding
+ *
+ * Written first with the pre-fix assertions and run green, which is how the following was found and
+ * it was not in the plan. Ordering the two runs as they are ordered here — the honest one first —
+ * the vacuous run that followed did not merely return a meaningless `clean`. Because `clean` is
+ * exactly the status that lifts a freeze (`reconcile.ts:204`, and that asymmetry is correct), the
+ * `liability_sum` run **deleted the `asset_freezes` row** the indexer-backed run had just written:
+ *
+ *     assert.equal(unobserved.unfroze, true)      // passed, before this commit
+ *     assert.deepEqual(await listFreezes(db()), []) // passed, before this commit
+ *
+ * So on a schedule where a real observation arrived occasionally and the vacuous sweep ran every
+ * interval, the sweep would reopen withdrawals on an asset a real check had frozen — and the last
+ * word always belonged to the run that had looked at nothing. A check that cannot fail is bad; a
+ * check that cannot fail and outranks the one that can is the defect that matters.
+ */
+test('THE DEFECT: a deposit that never happened on chain reconciles CLEAN with no observation', { skip }, async () => {
+  // A fabricated deposit of an ON-CHAIN asset: custody is debited and the user credited, in one
+  // balanced entry, with no transaction behind it on any chain. This is 00-current-state.md:22.
+  await post(depositEntry({ amount: 5_000n, assetCode: 'EMBER' }))
+
+  // What the chain actually holds. Nothing.
+  const truth = await reconcileAsset(db(), {
+    producer: 'ledger',
+    assetCode: 'EMBER',
+    chain: 'Hearth',
+    network: 'testnet',
+    tolerance: {},
+    indexerObservedTotal: 0n,
+  })
+  assert.equal(truth.observedSource, 'indexer')
+  assert.equal(truth.drift, '5000', 'the ledger claims 5000 EMBER the chain does not show')
+  assert.equal(truth.status, 'drift_exceeded')
+  assert.equal(truth.froze, true)
+
+  // The identical ledger state, reconciled the way the scheduled job actually reconciled it.
+  //
+  // BEFORE THIS COMMIT this returned status 'clean', drift '0', observed_source 'liability_sum',
+  // froze false — a green run over 5000 EMBER of thin air. AFTER it, the absence of an indexer
+  // reading is itself the finding: no observation, no drift number, `failed`, and the asset stays
+  // frozen. Absence of evidence must not read as evidence.
+  const unobserved = await run('EMBER')
+
+  assert.equal(unobserved.observedSource, 'unavailable')
+  assert.equal(unobserved.indexerObservedTotal, null, 'an unknown must be recorded as unknown, never as 0')
+  assert.equal(unobserved.drift, null, 'there is no drift to state without something to compare against')
+  assert.equal(unobserved.status, 'failed')
+  assert.equal(unobserved.ledgerCustodyTotal, '5000', 'the half we DO know is still recorded')
+
+  // `freezesWithdrawals('failed')` is true, so an unobservable asset is a frozen asset.
+  assert.equal(unobserved.unfroze, false, 'a run that observed nothing may never lift a freeze')
+  const freezes = await listFreezes(db())
+  assert.equal(freezes.length, 1)
+  assert.equal(freezes[0]!.assetCode, 'EMBER')
+  assert.match(freezes[0]!.reason, /no indexer observation/)
+})
 
 /* ================================================================== the invariant */
 
@@ -272,12 +358,172 @@ test('an indexer-supplied total is compared and labelled as such', { skip }, asy
   assert.equal(result.status, 'drift_exceeded')
 })
 
-test('an asset with no accounts at all reconciles clean at zero', { skip }, async () => {
-  // A run that proves an asset is at zero is still a run worth recording.
+/**
+ * **The seductive case, and the one this test used to get wrong.**
+ *
+ * It asserted that EMBER with no accounts "reconciles clean at zero", and the reasoning felt
+ * obvious: there is nothing there, so there is nothing to be wrong about. It is not obvious and it
+ * is not true. "Our custody is zero" is still a CLAIM about a chain, and the run that made it had
+ * not looked at one — it had asked this ledger's liability accounts, found them empty too, and
+ * subtracted zero from zero. Two numbers from the same empty table agreeing is not evidence.
+ *
+ * Kept as a test because the empty case is exactly where a vacuous check hides best: it produces
+ * the tidiest possible green.
+ */
+test('an on-chain asset with no accounts is NOT clean — nobody asked the chain', { skip }, async () => {
   const result = await run('EMBER')
+
+  assert.equal(result.status, 'failed')
+  assert.equal(result.observedSource, 'unavailable')
+  assert.equal(result.ledgerCustodyTotal, '0')
+  assert.equal(result.drift, null, '0 - 0 = 0 was never a measurement')
+})
+
+test('an on-chain asset OBSERVED at zero is clean, and that is a different fact', { skip }, async () => {
+  // The same ledger state as above, plus the one thing that was missing: somebody looked.
+  const result = await reconcileAsset(db(), {
+    producer: 'ledger',
+    assetCode: 'EMBER',
+    chain: 'Hearth',
+    network: 'testnet',
+    tolerance: {},
+    indexerObservedTotal: 0n,
+  })
   assert.equal(result.status, 'clean')
+  assert.equal(result.observedSource, 'indexer')
+  assert.equal(result.drift, '0')
+})
+
+test('a PLATFORM asset with no accounts still reconciles clean at zero', { skip }, async () => {
+  // SHARD is absent from ON_CHAIN_ASSETS and has no chain to observe, so the internal identity is
+  // the only check available and it remains a real one. This commit must not have broken it by
+  // demanding a feed that can never exist.
+  const result = await run('SHARD')
+  assert.equal(result.status, 'clean')
+  assert.equal(result.observedSource, 'liability_sum')
   assert.equal(result.ledgerCustodyTotal, '0')
   assert.equal(result.drift, '0')
+})
+
+/* ====================================================== the schema, not the handler */
+
+/**
+ * **Every test in this section goes around `reconcileAsset` entirely.**
+ *
+ * That is the whole point of putting the rule in the schema. A guard that lives only in the handler
+ * is bypassed by a bug in the handler, by a later migration, or by an operator with a psql
+ * connection — and the third is not hypothetical, it is how a stuck reconciliation gets "fixed" at
+ * 3am. These insert raw rows the way `psql` would, and assert the database refuses them.
+ *
+ * `23514` is `check_violation`. The trigger raises it explicitly so a caller cannot tell the
+ * table-reading rule from the CHECK-expressible ones, and does not need to.
+ */
+const CHECK_VIOLATION = '23514'
+
+/** A raw run row, bypassing every line of `reconcile.ts`. Overridable field by field. */
+async function rawRun(fields: Record<string, unknown>): Promise<void> {
+  const row = {
+    chain: 'Hearth',
+    network: 'testnet',
+    asset_code: 'EMBER',
+    ledger_custody_total: '5000',
+    indexer_observed_total: '5000',
+    drift: '0',
+    status: 'clean',
+    observed_source: 'indexer',
+    ...fields,
+  }
+  await sql`insert into reconciliation_runs ${sql(row as never)}`
+}
+
+async function refuses(fields: Record<string, unknown>, constraint: RegExp): Promise<void> {
+  await assert.rejects(
+    () => rawRun(fields),
+    (err: unknown) => {
+      const e = err as { code?: string; message?: string; constraint_name?: string }
+      assert.equal(e.code, CHECK_VIOLATION, `expected a check violation, got ${e.code}: ${e.message}`)
+      assert.match(`${e.constraint_name ?? ''} ${e.message ?? ''}`, constraint)
+      return true
+    },
+  )
+}
+
+test('SCHEMA: an on-chain asset may not be attested by the ledger’s own books', { skip }, async () => {
+  // The exact row every scheduled run wrote before this commit, offered directly to Postgres.
+  await refuses(
+    { asset_code: 'EMBER', observed_source: 'liability_sum' },
+    /may not use observed_source=liability_sum/,
+  )
+  // Not just EMBER. Every asset the estate declares as chain-settled.
+  for (const asset of ON_CHAIN_ASSETS) {
+    await refuses({ asset_code: asset, observed_source: 'liability_sum' }, /liability_sum/)
+  }
+})
+
+test('SCHEMA: the trigger covers UPDATE, so a run cannot be relabelled after the fact', { skip }, async () => {
+  await rawRun({ asset_code: 'EMBER', observed_source: 'indexer' })
+  // `update ... set observed_source = 'liability_sum'` would launder a failed run into a checked
+  // one without inserting anything. BEFORE INSERT alone would have missed this entirely.
+  await assert.rejects(
+    () => sql`update reconciliation_runs set observed_source = 'liability_sum' where asset_code = 'EMBER'`,
+    (err: unknown) => (err as { code?: string }).code === CHECK_VIOLATION,
+  )
+})
+
+test('SCHEMA: a platform asset is NOT caught by the chain rule', { skip }, async () => {
+  // The guard must refuse the vacuous case without refusing the legitimate one. SHARD has no chain,
+  // so `liability_sum` is correct for it and must remain insertable.
+  await assert.doesNotReject(() =>
+    rawRun({ asset_code: 'SHARD', chain: 'platform', observed_source: 'liability_sum' }),
+  )
+})
+
+test('SCHEMA: an unobserved run may not be clean — absence of evidence is not evidence', { skip }, async () => {
+  const unobserved = { observed_source: 'unavailable', indexer_observed_total: null, drift: null }
+  for (const status of ['clean', 'drift_within_tolerance', 'drift_exceeded']) {
+    await refuses({ ...unobserved, status }, /unobserved_failed/)
+  }
+  // `failed` is the only status it may carry, and it must remain insertable.
+  await assert.doesNotReject(() => rawRun({ ...unobserved, status: 'failed' }))
+})
+
+test('SCHEMA: an unknown is recorded as unknown, and may not be laundered into a zero', { skip }, async () => {
+  // The defect this release removes, in its purest form: no observation, written down as 0.
+  await refuses(
+    { observed_source: 'unavailable', indexer_observed_total: '0', drift: '0', status: 'failed' },
+    /unobserved_chk/,
+  )
+  // And the mirror — a NULL total under a source that claims one was obtained.
+  await refuses({ observed_source: 'indexer', indexer_observed_total: null, drift: null }, /unobserved_chk/)
+  // A drift stated beside an absent observation: 0 − nothing is not 0.
+  await refuses(
+    { observed_source: 'unavailable', indexer_observed_total: null, drift: '0', status: 'failed' },
+    /drift_chk/,
+  )
+})
+
+/**
+ * **The one copy this design could not avoid, kept honest by this test.**
+ *
+ * A CHECK cannot reference another table and migration text is checksummed, so the on-chain list
+ * had to exist a second time as rows in `chain_assets` (migrations.ts, version 11). A second list
+ * is exactly the kind of thing that drifts in silence, so it gets a test that names the drift.
+ *
+ * If this fails, do NOT edit migration 11 — `@cloudsforge/db` refuses a changed migration by
+ * checksum, and rightly. Add a new one that inserts or deletes the row.
+ */
+test('SCHEMA: chain_assets is exactly ON_CHAIN_ASSETS, or this whole guard is aimed wrong', { skip }, async () => {
+  const rows = await sql<{ asset_code: string }[]>`select asset_code from chain_assets order by asset_code`
+  assert.deepEqual(
+    rows.map((r) => r.asset_code),
+    [...ON_CHAIN_ASSETS].sort(),
+    'contracts/packages/chain/src/index.ts:123 and migration 11 disagree about which assets live on a chain',
+  )
+  // SHARD named explicitly: contracts-chain carries it in CHAINS with the comment "never used on
+  // chain", so `isChainAsset` returns TRUE for it. Using that predicate instead of this list would
+  // demand an indexer feed for Shards and freeze them permanently, and it would look like a
+  // working guard the entire time.
+  assert.ok(!rows.some((r) => r.asset_code === 'SHARD'))
 })
 
 /* ================================================================== the announcement */

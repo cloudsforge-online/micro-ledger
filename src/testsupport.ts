@@ -25,7 +25,16 @@ export const enabled = Boolean(url && /test/i.test(url))
 
 export const skip = enabled ? false : 'set LEDGER_TEST_DATABASE_URL (name must contain "test")'
 
-/** Every table the ledger owns, in an order that does not matter because CASCADE is used. */
+/**
+ * Every table the ledger owns **that holds test data**, in an order that does not matter because
+ * CASCADE is used.
+ *
+ * **`chain_assets` is deliberately absent.** It is reference data seeded by migration 11, not
+ * per-test state: truncating it would empty the list the reconciliation trigger consults, and every
+ * later test would then pass because the guard had nothing to match against — a whole suite going
+ * green by erasing the thing it exists to check. Adding it here is the single most plausible way to
+ * make this file lie.
+ */
 const ALL_TABLES = [
   'postings',
   'journal_entries',

@@ -60,6 +60,7 @@ test('every table the service reads or writes is created', () => {
     'idempotency_keys',
     'reconciliation_runs',
     'asset_freezes',
+    'chain_assets',
   ]) {
     assert.match(sql, new RegExp(`create table if not exists ${table}\\b`), `${table} is missing`)
   }
@@ -107,6 +108,71 @@ test('INVARIANT 5 fires AFTER, because the projection is written as a delta', ()
   // fails for the right reason by accident. This assertion is the guard on that.
   assert.match(sql, /create trigger balances_no_overdraft\s+after insert or update on balances/)
   assert.doesNotMatch(sql, /create trigger balances_no_overdraft\s+before/)
+})
+
+/**
+ * **INVARIANT 6: a reconciliation of an on-chain asset cannot pass without a chain observation.**
+ *
+ * The other five are about the books being consistent. This one is about the books being TRUE, and
+ * it is the one the estate's economics rest on: `docs/ecosystem/00-current-state.md:22` — "Custodial
+ * EMBER can be minted with no chain movement."
+ *
+ * It is asserted here, against the migration TEXT, as well as behaviourally against a live database
+ * in `reconcile.test.ts`. That is not duplication. The behavioural tests prove the rule holds in the
+ * schema this build produces; these prove the statements are still IN the migration, so deleting one
+ * fails loudly rather than leaving a suite that passes because it never exercised the deleted line.
+ * Migration 9 shipped with `observed_source in ('liability_sum','indexer')` and a comment explaining
+ * that the indexer did not exist yet; the comment stopped being true and the constraint did not
+ * follow, which is precisely the failure mode a text assertion catches.
+ */
+test('INVARIANT 6: liability_sum is refused for an on-chain asset, by a trigger that reads chain_assets', () => {
+  // A CHECK cannot reference another table, so this rule must be a trigger. Asserting the trigger
+  // exists AND that it is BEFORE INSERT OR UPDATE: covering INSERT alone would leave
+  // `update reconciliation_runs set observed_source = 'liability_sum'` as an open door.
+  assert.match(
+    sql,
+    /create trigger reconciliation_runs_chain_observation_trg\s+before insert or update on reconciliation_runs/,
+  )
+  assert.match(sql, /if new\.observed_source = 'liability_sum'\s+and exists \(select 1 from chain_assets/)
+  // It must raise a check violation, not a bare error, so a caller cannot tell it from a CHECK.
+  assert.match(sql, /using errcode = '23514'/)
+})
+
+test('INVARIANT 6: an unobserved run is failed, and its numbers are NULL rather than zero', () => {
+  // Absence of evidence must not read as evidence. `freezesWithdrawals('failed')` is true and only
+  // 'clean' lifts a freeze, so these three lines are what make an unobservable asset unwithdrawable.
+  assert.match(sql, /reconciliation_runs_unobserved_failed_chk check \(\s*observed_source <> 'unavailable' or status = 'failed'\s*\)/)
+  assert.match(sql, /reconciliation_runs_unobserved_chk check \(\s*\(observed_source = 'unavailable'\) = \(indexer_observed_total is null\)\s*\)/)
+  assert.match(sql, /reconciliation_runs_drift_chk check \(\s*\(indexer_observed_total is null\) = \(drift is null\)\s*\)/)
+
+  // NULL has to be reachable for any of the above to mean anything. Migration 9 declared both
+  // columns `not null default 0`, which is exactly how "we did not look" became "the chain holds
+  // nothing" — so the drop is load-bearing, not tidying.
+  assert.match(sql, /alter column indexer_observed_total drop not null/)
+  assert.match(sql, /alter column drift drop not null/)
+  assert.match(sql, /alter column indexer_observed_total drop default/)
+  assert.match(sql, /alter column drift drop default/)
+})
+
+test('INVARIANT 6: the chain asset list is data, not text baked into a constraint', () => {
+  // Two reasons this must be a table, and the second one is a landmine rather than a preference:
+  //
+  //   * a CHECK cannot reference another table, and inlining the codes would be a second copy of
+  //     ON_CHAIN_ASSETS free to drift from the first;
+  //   * migration text is CHECKSUMMED (@cloudsforge/db `checksumOf`), so generating the list into
+  //     the SQL from the imported constant would mean adding a sixth chain asset silently altered
+  //     an APPLIED migration and every deployment refused to start.
+  //
+  // So the codes appear as INSERTed rows and nowhere else. If a future edit inlines them into the
+  // constraint, this fails.
+  assert.match(sql, /insert into chain_assets \(asset_code, note\) values/)
+  assert.doesNotMatch(sql, /observed_source in \([^)]*'liability_sum'[^)]*\)\s*and\s*asset_code in/i)
+
+  const version11 = MIGRATIONS.find((m) => m.name === 'chain_backed_reconciliation')
+  assert.ok(version11, 'migration 11 is missing')
+  // The list is imported into the SERVICE from contracts-chain; the database copy is seeded once
+  // here. `reconcile.test.ts` asserts the two are equal against a live table.
+  assert.doesNotMatch(version11.up, /\$\{/, 'migration text must be a literal — an interpolated list would change its checksum')
 })
 
 /* ------------------------------------------------------------------ shape */

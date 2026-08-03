@@ -611,6 +611,166 @@ export const MIGRATIONS: readonly Migration[] = [
       );
     `,
   },
+
+  {
+    version: 11,
+    name: 'chain_backed_reconciliation',
+    up: `
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+      -- A CHECK THAT COULD NOT FAIL, GUARDING THE PROPERTY THE ECONOMY RESTS ON.
+      --
+      -- Migration 9 above permits observed_source in ('liability_sum', 'indexer') for EVERY asset,
+      -- and its own comment says why: the indexer did not exist, so the internal half was the only
+      -- half checkable. That is no longer true — micro-indexer has Bitcoin, Solana and EVM families
+      -- with reorg handling — but the schema still accepted the vacuous answer, and every scheduled
+      -- run in this service's life gave it. No production caller ever supplied an indexer total.
+      --
+      -- 'liability_sum' compares this ledger's custody accounts against this ledger's liability
+      -- accounts. It is a real check of an INTERNAL identity and it catches convertCoinToEmber — a
+      -- liability credited against no custody position. It CANNOT see a chain. A fabricated deposit
+      -- moves both sides at once, so the books balance perfectly about coin that does not exist,
+      -- and the run reports clean. Worse: 'clean' is the status that LIFTS a withdrawal freeze, so
+      -- a vacuous run overrode a real one that had frozen the asset moments earlier.
+      --
+      -- 00-current-state.md:22 — "Custodial EMBER can be minted with no chain movement." The owner's
+      -- decision is that the economics of the ecosystem must be valid FROM CHAIN. This migration is
+      -- where that stops being a sentence in a document.
+      --
+      -- ── WHAT A SCHEMA CAN AND CANNOT DO HERE ─────────────────────────────────────────────────
+      --
+      -- It cannot verify the invariant. No constraint in this database can see a chain, and
+      -- indexer_observed_total is an assertion by whoever called the job. A caller determined to
+      -- fabricate one still can, and nothing below would notice. That is not a gap this migration
+      -- can close — it is the honest boundary of a schema, and pretending otherwise would build a
+      -- second check that cannot fail.
+      --
+      -- What it CAN do is refuse a run that never had evidence to begin with:
+      --
+      --   1. An on-chain asset may not be attested by this ledger's own books. observed_source
+      --      'liability_sum' is illegal when the asset is chain-backed.
+      --   2. A run with no observation must record 'unavailable', a NULL observed total, a NULL
+      --      drift, and status 'failed'. It may not launder an absence into a zero.
+      --
+      -- Both are worth having precisely because they are mechanical. A handler-only guard is
+      -- bypassed by a bug, a later migration, or an operator with a psql connection.
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+
+      -- Which assets are settled on a chain, and therefore may only be reconciled against one.
+      --
+      -- A TABLE rather than a literal list inside the CHECK, for two reasons that both bite:
+      --
+      --   * A CHECK cannot reference another table, and the alternative — inlining
+      --     ('EMBER','BTC','ETH','SOL','XRP') into the constraint text — is a SECOND declaration of
+      --     ON_CHAIN_ASSETS (contracts/packages/chain/src/index.ts:123) that would drift from the
+      --     first in silence. contracts-money makes the same point about re-listing asset codes.
+      --   * The migration text is CHECKSUMMED (@cloudsforge/db, checksumOf). Generating the list
+      --     into this string from the imported constant would mean that adding a sixth chain asset
+      --     silently changes an APPLIED migration's checksum, and every deployment would then refuse
+      --     to start. A new chain asset is a new migration inserting a row, which is exactly right:
+      --     it is a schema event, and it should leave a version behind.
+      --
+      -- 'reconcile.test.ts' asserts this table's contents equal ON_CHAIN_ASSETS, so the copy cannot
+      -- go stale without a red test naming it.
+      --
+      -- SHARD is deliberately absent. contracts-chain gives it family 'evm' with the comment
+      -- "never used on chain; present so the record is total", jobs.ts:chainNameFor records it as
+      -- 'platform', and it has no chain to observe. Its internal identity is the only check there
+      -- is for it, and that check is a real one — this migration must not break it.
+      create table if not exists chain_assets (
+        asset_code text primary key,
+        -- Why this asset is here, so a later reader is not left guessing whether an entry was
+        -- deliberate. Read by nothing; it exists to be read by a person.
+        note       text not null
+      );
+
+      insert into chain_assets (asset_code, note) values
+        ('EMBER', 'Hearth native. ON_CHAIN_ASSETS[0]. See the note on EMBER in reconcile.ts.'),
+        ('BTC',   'Bitcoin. micro-indexer has a bitcoin family with reorg handling.'),
+        ('ETH',   'EVM. micro-indexer has an evm family with reorg handling.'),
+        ('SOL',   'Solana. micro-indexer has a solana family with reorg handling.'),
+        ('XRP',   'XRP Ledger.')
+      on conflict (asset_code) do nothing;
+
+      -- ── 'unavailable': the third source, and the only honest one when nothing observed ────────
+      alter table reconciliation_runs
+        drop constraint if exists reconciliation_runs_source_chk;
+
+      alter table reconciliation_runs
+        add constraint reconciliation_runs_source_chk check (
+          observed_source in ('liability_sum', 'indexer', 'unavailable')
+        );
+
+      -- **NULL, not 0.** A zero that means "we did not look" is this estate's signature defect in
+      -- miniature: a value that reads as safe when it means nothing. numeric(78,0) NOT NULL DEFAULT 0
+      -- forced exactly that lie, so both measured columns become nullable and NULL is reserved for
+      -- "unknown". Existing rows are unaffected: they all carry an observed_source of 'liability_sum'
+      -- or 'indexer' and non-null totals, so every constraint below validates against them as-is.
+      alter table reconciliation_runs alter column indexer_observed_total drop not null;
+      alter table reconciliation_runs alter column indexer_observed_total drop default;
+      alter table reconciliation_runs alter column drift drop not null;
+      alter table reconciliation_runs alter column drift drop default;
+
+      -- Unknown is recorded as unknown, and ONLY then. Both directions, so neither
+      -- "source says unavailable but a total is stated" nor "no total but the source claims one"
+      -- can be written. Every operand is a NOT NULL column or an IS NULL predicate, so there is no
+      -- three-valued-logic hole here — a CHECK that evaluates to NULL passes, and that is how this
+      -- kind of constraint is usually silently vacuous.
+      alter table reconciliation_runs
+        add constraint reconciliation_runs_unobserved_chk check (
+          (observed_source = 'unavailable') = (indexer_observed_total is null)
+        );
+
+      -- No drift without two numbers to subtract. Stating a drift of 0 beside an absent observation
+      -- is the same laundering as above, one column over.
+      alter table reconciliation_runs
+        add constraint reconciliation_runs_drift_chk check (
+          (indexer_observed_total is null) = (drift is null)
+        );
+
+      -- **ABSENCE OF EVIDENCE IS NOT EVIDENCE.** A run that observed nothing is 'failed', never
+      -- 'clean' and never 'drift_within_tolerance'. This is the constraint that stops the whole
+      -- defect coming back through a different door: freezesWithdrawals('failed') is true, so an
+      -- asset nobody can observe is an asset nobody can withdraw, and — because only 'clean' lifts
+      -- a freeze — such a run can never release one either.
+      alter table reconciliation_runs
+        add constraint reconciliation_runs_unobserved_failed_chk check (
+          observed_source <> 'unavailable' or status = 'failed'
+        );
+
+      -- ── the rule a CHECK cannot express, because it must read another table ───────────────────
+      --
+      -- A trigger rather than a CHECK is forced by Postgres, not chosen: a CHECK may not reference
+      -- chain_assets. It raises 23514 (check_violation) so a caller that already handles constraint
+      -- violations treats it identically to one.
+      --
+      -- BEFORE INSERT OR UPDATE, not INSERT alone. UPDATE is a genuine bypass —
+      -- 'update reconciliation_runs set observed_source = ''liability_sum''' would otherwise
+      -- relabel a failed run as a checked one — and these rows are insert-only in the service, so
+      -- covering UPDATE costs nothing real.
+      create or replace function reconciliation_runs_require_chain_observation()
+        returns trigger
+        language plpgsql
+      as $$
+      begin
+        if new.observed_source = 'liability_sum'
+           and exists (select 1 from chain_assets c where c.asset_code = new.asset_code)
+        then
+          raise exception
+            'reconciliation of on-chain asset % may not use observed_source=liability_sum: comparing this ledger against itself proves nothing about the chain',
+            new.asset_code
+            using errcode = '23514';
+        end if;
+        return new;
+      end;
+      $$;
+
+      drop trigger if exists reconciliation_runs_chain_observation_trg on reconciliation_runs;
+      create trigger reconciliation_runs_chain_observation_trg
+        before insert or update on reconciliation_runs
+        for each row
+        execute function reconciliation_runs_require_chain_observation();
+    `,
+  },
 ]
 
 /**

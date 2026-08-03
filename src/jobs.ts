@@ -174,6 +174,41 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
   /**
    * Reconciliation. Compares Σ custody assets against the other side of the invariant for one
    * asset, records the run, and freezes or unfreezes withdrawals accordingly.
+   *
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   * **THIS HANDLER IS WHERE THE INDEXER CALL GOES, AND IT IS THE REASON EVERY CHAIN ASSET NOW
+   * FAILS.** Read this before "fixing" the failures.
+   *
+   * `reconcileAsset` takes an optional `indexerObservedTotal` and this call site has never supplied
+   * one — not once, in the life of the service. That is the whole defect: the ternary it fed
+   * silently selected `observed_source = 'liability_sum'`, so the reconciliation guarding "every
+   * EMBER balance is backed by real chain holdings" compared this ledger against this ledger.
+   * `reconcileAsset` no longer falls back for a chain asset, so until the call below exists, EMBER
+   * records `unavailable` / `failed` and stays frozen. **That is the correct state**, and the
+   * argument for it is on `Env.reconcileAssets` in env.ts.
+   *
+   * What `micro-indexer` must expose before this can be wired, stated precisely because the obvious
+   * endpoint is the wrong one:
+   *
+   *   * **An aggregate, not a per-address read.** It has `watched_addresses (chain, network,
+   *     address)` and per-address routes, but nothing that returns Σ confirmed native balance over
+   *     the custody set. Summing per-address reads HERE would be wrong: this service does not know
+   *     which addresses are custody's, and the set changes under it mid-sweep.
+   *   * **Confirmed only, at the chain's own depth.** `chainSpec(asset).confirmations`, so a
+   *     reorg-eligible block never becomes a drift that freezes withdrawals.
+   *   * **Coverage, and a refusal rather than a partial sum.** This is the one that will get
+   *     written wrong. A total missing one unreadable address is LOW, which reads here as a
+   *     positive drift — "the ledger claims coin the chain does not show" — and freezes the asset
+   *     on the strength of an RPC timeout. The indexer already holds this exact line for token
+   *     balances (`indexer/src/server.ts:479`: "a missing balance is missing, never zero, because
+   *     zero is what evicts a token-gated member"), and the aggregate must hold it too: incomplete
+   *     coverage must leave `indexerObservedTotal` UNDEFINED here, which records `unavailable` and
+   *     `failed`. A partial sum passed off as a total is the same lie this release removed from the
+   *     run row, sourced one service upstream.
+   *
+   * `micro-deploy` then owns the URL and the timeout. A missing or unreachable indexer must reach
+   * `reconcileAsset` as `undefined` — never as `0n`, which asserts an empty chain.
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
    */
   runner.register<{ assetCode?: string; network?: string }>(RECONCILE_KIND, async (job) => {
     const assetCode = job.payload.assetCode
@@ -192,10 +227,27 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
       producer: deps.producer,
     })
 
-    deps.metrics.set('ledger_reconciliation_drift', Number(result.drift), { asset: assetCode })
+    // **`Number(null)` is `0`.** This line read `Number(result.drift)` unconditionally, and now that
+    // an unobserved run reports `drift: null` that would publish a drift of exactly zero — the most
+    // reassuring number available — for the state in which nobody looked at the chain at all. The
+    // drift gauge is written only when a drift was actually computed, and
+    // `ledger_reconciliation_observed` is what tells a dashboard whether to believe it. A gauge
+    // cannot express "unknown", so the honest design is a second series that says so.
+    deps.metrics.set('ledger_reconciliation_observed', result.drift === null ? 0 : 1, { asset: assetCode })
+    if (result.drift !== null) {
+      deps.metrics.set('ledger_reconciliation_drift', Number(result.drift), { asset: assetCode })
+    }
 
     const log = deps.logger.child({ job: RECONCILE_KIND, asset: assetCode })
-    if (result.froze) {
+    if (result.observedSource === 'unavailable') {
+      // **A distinct message, because it demands a distinct action.** Both this and a drift freeze
+      // withdrawals, but "the numbers disagree" sends an operator to the arithmetic while "nobody
+      // observed the chain" sends them to the indexer feed. Logging them under one line would send
+      // every unobserved asset hunting a discrepancy that was never measured — and this is the
+      // state EMBER is in until Hearth's mainnet and its indexer feed exist, so it is the line that
+      // will actually be read.
+      log.fatal('RECONCILIATION HAD NO CHAIN OBSERVATION — withdrawals frozen', { ...result })
+    } else if (result.froze) {
       // Pages. Drift beyond tolerance means the ledger can no longer prove it holds what it owes,
       // and every withdrawal it settles until this is explained may be paying out value that is
       // not there.

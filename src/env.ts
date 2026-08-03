@@ -142,6 +142,41 @@ export interface Env {
    * Explicit rather than derived from the accounts table: an asset that has no accounts yet still
    * needs a run that proves it is at zero, and an operator must be able to see the list that is
    * actually being checked without inferring it from data.
+   *
+   * ════════════════════════════════════════════════════════════════════════════════════════════
+   * **THE DEFAULT INCLUDES EMBER, AND EMBER WILL FAIL EVERY RUN UNTIL AN INDEXER FEED EXISTS.**
+   *
+   * That is the intended behaviour, not an oversight, and it will freeze EMBER withdrawals on the
+   * first sweep after deploy. Whoever reads this because a page fired should read the argument
+   * before reaching for the workaround.
+   *
+   * `ON_CHAIN_ASSETS` (contracts/packages/chain/src/index.ts:123) lists EMBER, so `reconcileAsset`
+   * demands an observation for it and records `unavailable` / `failed` without one. Hearth's
+   * mainnet has not launched, so today there is nothing feeding it. The question is whether EMBER
+   * should therefore be exempted, and the answer is no, for four reasons:
+   *
+   *   1. **The estate already decided.** EMBER is in `ON_CHAIN_ASSETS`. Treating it as off-chain
+   *      here would create a second, contradicting list, which is the exact skew contracts-money
+   *      warns against when it refuses to re-declare asset codes.
+   *   2. **A pre-launch chain asset is not a special case, it is the worst case.** If Hearth has
+   *      not launched then no EMBER is backed by anything, and custodial EMBER existing under those
+   *      conditions IS `00-current-state.md:22` — "Custodial EMBER can be minted with no chain
+   *      movement" — rather than a temporary inconvenience on the way to fixing it.
+   *   3. **The failure is proportionate to what is actually at risk.** If EMBER custody is zero,
+   *      the freeze costs nothing: there is nothing to withdraw. If it is NOT zero, then the
+   *      platform is holding a liability it cannot prove backing for, and freezing withdrawals is
+   *      the correct response rather than the regrettable one. There is no third case where the
+   *      freeze is both costly and wrong.
+   *   4. **The alternative rebuilds the defect under a new name.** An `if (asset === 'EMBER')
+   *      return 'liability_sum'` is a check that cannot fail, on the one asset this entire release
+   *      is about.
+   *
+   * **The escape hatch is this variable, deliberately, and it is the only one.** An operator who
+   * accepts the risk removes EMBER from `LEDGER_RECONCILE_ASSETS`. That is a visible decision in a
+   * deploy manifest, attributable and reviewable, which a code exemption is not — and it makes the
+   * asset stop being *checked* rather than making it *look checked*. The freeze it leaves in place
+   * stays until an exactly-clean observed run lifts it, so the decision cannot be quietly forgotten.
+   * ════════════════════════════════════════════════════════════════════════════════════════════
    */
   readonly reconcileAssets: readonly LedgerAssetCode[]
   readonly reconcileNetwork: 'mainnet' | 'testnet'

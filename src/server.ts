@@ -117,7 +117,24 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
     })
     .register({
       name: 'ledger_reconciliation_drift',
-      help: 'Ledger custody total minus observed total, per asset. The sign carries the meaning.',
+      help: 'Ledger custody total minus observed total, per asset. The sign carries the meaning. Only set when a run actually observed something — read it with ledger_reconciliation_observed.',
+      kind: 'gauge',
+      labels: ['asset'],
+    })
+    /**
+     * **Read this BEFORE `ledger_reconciliation_drift`, or read that one wrong.**
+     *
+     * A gauge has no way to say "unknown": it holds its last value until something overwrites it.
+     * So an asset whose runs stop observing anything keeps publishing whatever drift it last had —
+     * and if that was 0, the dashboard shows a healthy zero forever while nobody is checking. That
+     * is the same defect this release removed from the run row, one layer out, and it is why
+     * `jobs.ts` sets 0 here and leaves the drift gauge untouched rather than writing
+     * `Number(result.drift)` — `Number(null)` is `0`, which would have published the most
+     * reassuring possible number for the least reassuring possible state.
+     */
+    .register({
+      name: 'ledger_reconciliation_observed',
+      help: '1 if the last reconciliation of this asset compared against a real observation, 0 if it had none. A 0 makes the drift gauge for that asset meaningless.',
       kind: 'gauge',
       labels: ['asset'],
     })
