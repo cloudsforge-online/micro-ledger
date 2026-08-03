@@ -136,6 +136,7 @@ const server = createServer({
 //    the Lifecycle for exactly that.
 const jobDeps: JobDeps = {
   sql: sql as unknown as Db,
+  producer: SERVICE,
   logger,
   metrics,
   signingSecret: env.outboxSigningSecret,

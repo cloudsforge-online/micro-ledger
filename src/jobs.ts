@@ -51,6 +51,13 @@ const HOUR = 60 * MINUTE
 
 export interface JobDeps {
   readonly sql: Db
+  /**
+   * The service name stamped on every outbox row this job writes.
+   *
+   * Needed since reconciliation started announcing itself: `producer` is checked against the topic's
+   * owner by `validateEnvelope`, so it is part of the envelope rather than a label.
+   */
+  readonly producer: string
   readonly logger: Logger
   readonly metrics: Metrics
   readonly signingSecret: string
@@ -182,6 +189,7 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
       chain: chainNameFor(assetCode as LedgerAssetCode),
       network,
       tolerance: deps.assetTolerance,
+      producer: deps.producer,
     })
 
     deps.metrics.set('ledger_reconciliation_drift', Number(result.drift), { asset: assetCode })

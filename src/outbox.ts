@@ -17,8 +17,15 @@
  * measured conditions under which that stops being true.
  */
 
-import { EVENT_ID_HEADER, SIGNATURE_HEADER, signDelivery, verifyDelivery } from '@cloudsforge/contracts-events'
-import { createHmac, timingSafeEqual } from 'node:crypto'
+import {
+  EVENT_ID_HEADER,
+  SIGNATURE_HEADER,
+  TOPIC_HEADER,
+  signDelivery,
+  validateEnvelope,
+  verifyDelivery,
+  type EventVersion,
+} from '@cloudsforge/contracts-events'
 import type { Sql, TransactionSql } from 'postgres'
 import { HttpClient } from '@cloudsforge/http'
 import type { Logger } from '@cloudsforge/telemetry'
@@ -39,7 +46,6 @@ export interface DomainEvent {
   readonly version?: number
 }
 
-/** The wire envelope. Additive-only, versioned per topic, schema-diff enforced — AD-02. */
 /**
  * The wire version, in the CONTRACT's shape.
  *
@@ -49,19 +55,21 @@ export interface DomainEvent {
  * verified was refused at the envelope. The stored column stays an integer — storage records the
  * major — and the mapping to the contract's shape happens here, at the wire, in one place.
  */
-const wireVersion = (v: number): `${number}.${number}` => `${v}.0` as `${number}.${number}`
+const wireVersion = (v: number): EventVersion => `${v}.0`
 
-export interface EventEnvelope {
-  readonly id: string
-  readonly topic: string
-  readonly key: string
-  readonly occurredAt: string
-  readonly producer: string
-  readonly version: `${number}.${number}`
-  readonly actor: string | null
-  readonly correlationId: string | null
-  readonly payload: Record<string, unknown>
-}
+/**
+ * The wire envelope is `@cloudsforge/contracts-events`' — re-exported, not redeclared.
+ *
+ * The local copy that used to sit here typed `actor` and `correlationId` as `string | null` and let
+ * the nullable COLUMNS through untouched. The contract requires an `Actor` and a non-null
+ * `correlationId` and refuses both nulls, so any event emitted without them was unreadable by every
+ * consumer in the estate. `ledger.entry.posted` happened to survive that because a posting always
+ * carries a request's actor and correlation id; `ledger.reconciliation.completed` has neither — it
+ * is a leased job woken by a schedule — so the very first thing this service emits from a job would
+ * have been refused at the envelope. See `buildEnvelope`.
+ */
+export type { EventEnvelope } from '@cloudsforge/contracts-events'
+import type { EventEnvelope } from '@cloudsforge/contracts-events'
 
 export type Emit = (event: DomainEvent) => void
 
@@ -135,6 +143,69 @@ export function verifyEventSignature(body: string, secret: string, presented: st
 
 /* ------------------------------------------------------------------------ relay */
 
+/**
+ * The envelope as this file can prove it at COMPILE time, before the classifier looks at it.
+ *
+ * `version` is the contract's `EventVersion`, so `version: row.version` — the stored integer, which
+ * is exactly what `market`, `trade`, `community` and `devplatform` all shipped — is a type error
+ * rather than a test failure. `actor` and `correlationId` are non-nullable `string`, so the nullable
+ * columns cannot be passed through without a decision being made about them here.
+ *
+ * `topic` and `producer` stay `string`: they are a `TopicName` and a `ProducerService` on the wire
+ * but free text in the table, and a cast asserting them would be the producer vouching for itself.
+ * Those are checked at run time by the contract's own validator.
+ */
+interface EnvelopeCandidate {
+  readonly id: string
+  readonly topic: string
+  readonly key: string
+  readonly occurredAt: string
+  readonly producer: string
+  readonly version: EventVersion
+  readonly actor: string
+  readonly correlationId: string
+  readonly payload: Record<string, unknown>
+}
+
+/**
+ * An outbox row, as the contract's envelope — or the reasons it is not one.
+ *
+ * The stored row is looser than the wire: `actor` and `correlation_id` are nullable columns and
+ * `topic` and `producer` are free text, while `EventEnvelope` requires an `Actor`, a non-null
+ * `correlationId`, a registered `TopicName` and a known `ProducerService`. Rather than cast that gap
+ * away, this builds the envelope and hands it to the CONTRACT'S OWN `validateEnvelope`, so the
+ * relay's idea of a valid event and a subscriber's are the same function.
+ *
+ * `validateEnvelope` rather than `classifyEnvelope` here, and that is a fact about this service
+ * rather than a preference: **both** topics it emits are in the registry
+ * (`ledger.entry.posted` and `ledger.reconciliation.completed`), so an unregistered topic on this
+ * bus is a defect and not a lagging release. `src/topics.ts` asserts that in both directions, and
+ * carries the quarantine machinery for the day this service invents a third.
+ *
+ * `system` for a missing actor is the contract's own value for "no principal did this" — a
+ * scheduled reconciliation — which is exactly what a null actor column means here. A missing
+ * correlation id falls back to the event id: an id that ties the event to itself is weaker than one
+ * that ties it to the request, but it is never absent, and an absent one is where a cross-service
+ * investigation stops.
+ */
+export function buildEnvelope(
+  row: OutboxRow,
+): { ok: true; value: EventEnvelope } | { ok: false; defects: readonly string[] } {
+  const candidate: EnvelopeCandidate = {
+    id: row.id,
+    topic: row.topic,
+    key: row.key,
+    occurredAt: row.occurred_at.toISOString(),
+    producer: row.producer,
+    version: wireVersion(row.version),
+    actor: row.actor ?? 'system',
+    correlationId: row.correlation_id ?? row.id,
+    payload: row.payload,
+  }
+  const verdict = validateEnvelope(candidate)
+  return verdict.ok ? { ok: true, value: verdict.value } : { ok: false, defects: verdict.errors }
+}
+
 export interface RelayDeps {
   readonly sql: Db
   readonly logger: Logger
@@ -145,7 +216,7 @@ export interface RelayDeps {
   readonly clientFor?: (url: string) => Pick<HttpClient, 'request'>
 }
 
-interface OutboxRow {
+export interface OutboxRow {
   readonly id: string
   readonly topic: string
   readonly key: string
@@ -203,17 +274,24 @@ export function createRelay(deps: RelayDeps): Handler {
         select id, url from event_subscriptions where topic = ${event.topic} and active = true
       `
 
-      const envelope: EventEnvelope = {
-        id: event.id,
-        topic: event.topic,
-        key: event.key,
-        occurredAt: event.occurred_at.toISOString(),
-        producer: event.producer,
-        version: wireVersion(event.version),
-        actor: event.actor,
-        correlationId: event.correlation_id,
-        payload: event.payload,
+      const built = buildEnvelope(event)
+      if (!built.ok) {
+        // REFUSED HERE RATHER THAN SENT. An envelope the contract rejects is one every subscriber
+        // rejects, so relaying it burns a retry budget delivering something nobody can accept —
+        // and `market`, `trade`, `community` and `devplatform` all shipped exactly that for weeks
+        // without noticing, because their suites verified against their own fake buses.
+        //
+        // Logged and SKIPPED, not published: the row stays unpublished so the defect is visible in
+        // the backlog and is delivered once whatever produced it is fixed, rather than being
+        // silently marked done.
+        deps.logger.error('outbox row is not a valid envelope; not relayed', {
+          eventId: event.id,
+          topic: event.topic,
+          defects: built.defects,
+        })
+        continue
       }
+      const envelope = built.value
       // Signed over the exact bytes `HttpClient` will send: it stringifies the same object with
       // the same key order, so the MAC a subscriber recomputes over the received body matches.
       const signature = signEvent(JSON.stringify(envelope), deps.signingSecret)
@@ -283,7 +361,11 @@ async function deliver(
       // The event id is the idempotency key, which is what makes this POST safe to retry and is
       // the same value the subscriber dedupes on.
       idempotencyKey: envelope.id,
-      headers: { [SIGNATURE_HEADER]: signature, [EVENT_ID_HEADER]: envelope.id },
+      headers: {
+        [SIGNATURE_HEADER]: signature,
+        [EVENT_ID_HEADER]: envelope.id,
+        [TOPIC_HEADER]: envelope.topic,
+      },
       ...(envelope.correlationId ? { requestId: envelope.correlationId } : {}),
     })
     await deps.sql`
@@ -340,4 +422,4 @@ export async function withInbox<T>(
   return outcome.result
 }
 
-export { EVENT_ID_HEADER, SIGNATURE_HEADER }
+export { EVENT_ID_HEADER, SIGNATURE_HEADER, TOPIC_HEADER }

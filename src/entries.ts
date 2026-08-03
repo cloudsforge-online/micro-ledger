@@ -185,6 +185,20 @@ export interface EntryView {
 }
 
 /**
+ * The topic a posted entry announces itself on.
+ *
+ * Named rather than inlined into the SQL below, for a reason `micro-org`'s estate checker had to
+ * learn the hard way: this event is written by a **raw `insert into outbox (topic, …) values (…)`**
+ * and not through a `topic:` property, so a grep for the emit-site shape finds nothing here and
+ * reports the service as emitting no events at all. A constant makes the name reachable from
+ * `topics.ts`, which is what lets the guard reconcile it against the registry in both directions.
+ *
+ * FIRST of the eight topics of 02-target-architecture §5, keyed by the account of the first posting,
+ * and the only source of per-product revenue.
+ */
+export const ENTRY_POSTED = 'ledger.entry.posted'
+
+/**
  * The entry kinds that reconciliation's freeze blocks.
  *
  * `withdrawal_refunded` is deliberately absent. A refund returns value to the user; blocking it
@@ -424,7 +438,7 @@ async function writeEntry(
   await tx`
     insert into outbox (topic, key, producer, version, actor, correlation_id, payload)
     values (
-      'ledger.entry.posted',
+      ${ENTRY_POSTED},
       ${entryId},
       ${producer},
       1,
