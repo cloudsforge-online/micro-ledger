@@ -218,6 +218,9 @@ test-only knob. A known placeholder value is refused at boot rather than accepte
 | `LEDGER_ASSET_TOLERANCE` | `{}` | JSON of asset → smallest-unit string. **An asset absent from the map gets zero tolerance, not infinity** — `withinTolerance` fails closed and this parser must not undo that (`src/env.ts:95`, reasoning at `:83-93`). Set too high and drift stops freezing withdrawals |
 | `LEDGER_RECONCILE_ASSETS` | `SHARD,EMBER` | the list actually swept. An asset omitted here is **never reconciled** — explicit rather than derived from `accounts` so an operator can read the list without inferring it from data. **The default includes EMBER, and EMBER fails every run and freezes withdrawals until `micro-indexer` supplies an aggregate**: it is in `ON_CHAIN_ASSETS`, Hearth's mainnet has not launched, and an asset nobody can observe is one nobody should be able to withdraw. Removing it here is the *only* supported exemption, because it makes the asset stop being checked rather than making it look checked (`src/env.ts`, argument on `Env.reconcileAssets`) |
 | `LEDGER_RECONCILE_NETWORK` | `testnet` | must be `mainnet` or `testnet`; recorded on every run row (`src/env.ts:168`) |
+| `INDEXER_URL` | — | where the chain half of the invariant is read from. **Optional, and unset is not a disabled check — it is a failing one:** with no client every `ON_CHAIN_ASSETS` member records `unavailable`/`failed` and freezes. Optional only because `src/migrator.ts` shares this env module and `ledger-migrate` is given no indexer, so demanding it would kill the container the estate's schema waits on. Must be an absolute `http`/`https` URL or boot fails, so `indexer:4000` names itself here rather than at the fifteen-minute mark (`src/env.ts`, `optionalUrl`) |
+| `LEDGER_INDEXER_DEADLINE_MS` | `5000` | integer 100–60000. **Bounds a job's lease as much as a request**: the handler holds its lease for the whole call, so a provider holding the socket open blocks the asset's next sweep |
+| `LEDGER_SERVICE_TOKEN` | — | the credential presented to the indexer. **Unset is a supported mode and it fails closed**: the call 401s, which is no observation, which freezes. Checked for placeholders and length when it *is* set. The grant is derived from `INDEXER_SCOPES` (`src/indexerclient.ts`) by `deploy/scripts/derive-grants.mjs`; a grant hand-added to compose fails that check |
 | `LEDGER_IDEMPOTENCY_TTL_DAYS` | `30` | **expiring a key early means the next replay does the work a second time**, so this must outlive every caller's retry horizon rather than be as short as the table would like (`src/env.ts:195`, reasoning at `:148-152`) |
 | `LEDGER_TEST_DATABASE_URL` | — | tests only. Unset, every database-backed test **skips**; the database name must contain `test` because the suite truncates |
 
@@ -230,12 +233,13 @@ collector — leaving an operator with a container that exits instantly and no r
 
 ## What it talks to
 
-**The ledger makes no outbound call to another CloudsForge service.** Grepping the non-test sources
-for `fetch(` finds one hit and it is a `new URL()` base, not a request (`src/server.ts:190`). It has
-exactly two network relationships:
+**The ledger makes exactly one outbound domain call, and it is the one this service's entire
+solvency argument rests on.** This section used to say it made none; that was true, and it was the
+defect. Three network relationships:
 
 | Upstream | What it calls | When it is down |
 | --- | --- | --- |
+| `micro-indexer` | `GET /v1/custody/:chain/:network/total` — Σ confirmed native balance over the custody set — once per chain asset per reconciliation sweep (`src/indexerclient.ts`, called from `src/jobs.ts`) | **fail closed, and loudly.** Every non-answer maps to `undefined`, which records `observed_source = 'unavailable'`, `status = 'failed'`, and **freezes withdrawals for that asset** until an exactly-clean observed run lifts it. That is the intended behaviour: an asset whose backing nobody can see is an asset nobody should be able to withdraw. There is no retry (it would spend the job's lease on an outage) and no fallback of any kind |
 | `micro-identity` | its JWKS document at `IDENTITY_JWKS_URL`, fetched by `@cloudsforge/auth`'s `Verifier` (`src/index.ts:107`) | **fail closed for new tokens, but not fatal.** Every domain route answers **503 `verifier_unavailable`**, never 401 (`src/server.ts:268`). The readiness probe is deliberately **soft** (`src/index.ts:103-107`): marking it hard would remove every service in the estate from its load balancer on one identity blip, which is a cascade, not a safety measure |
 | whatever rows are in `event_subscriptions` | signed HMAC event deliveries from the outbox relay (`src/outbox.ts:241`) | **fail open, per subscriber.** A failed delivery records `last_error` and leaves `delivered_at` null; the batch continues and the job succeeds, because one dead subscriber must not stop the stream. The undelivered row is the durable record (`src/outbox.ts:277-284`) |
 
@@ -266,7 +270,15 @@ docker run -d --rm --name ledger-pg \
 LEDGER_TEST_DATABASE_URL=postgres://ledger:ledger@127.0.0.1:55432/ledger_test pnpm test
 ```
 
-**122 `test(` declarations, `node:test` only.** They run against a real database because the most
+`src/chainbacking.test.ts` additionally drives the **real `micro-indexer` server** across the
+checkout when a second test database is provided, so the chain from `eth_getBalance` to a row in
+`reconciliation_runs` contains no test double at all. Without it, only its four `LIVE` cases skip:
+
+```bash
+LEDGER_TEST_DATABASE_URL=… INDEXER_TEST_DATABASE_URL=… pnpm test
+```
+
+**181 `test(` declarations, `node:test` only.** They run against a real database because the most
 important controls here are a deferred constraint trigger and two immutability triggers, and none of
 them can be proved against a fake. `--test-concurrency=1` is required rather than preferred: every
 database test file truncates between cases, `node:test` runs *files* in parallel by default, and a
@@ -280,20 +292,31 @@ skipped** (`.github/workflows/ci.yml`), which is what stops a green run that pro
 
 ## Known gaps
 
-* **Reconciliation cannot silently check only the internal half any more — but nothing supplies the
-  external half yet, so every chain asset now FAILS and freezes.** This bullet used to describe the
-  gap as benign and it was not. `reconcileAsset` selected `'liability_sum'` whenever no
-  `indexerObservedTotal` was passed, and **no production caller ever passed one**, so every run in
-  the service's life compared this ledger against itself. Worse than vacuous: `clean` is the status
-  that *lifts* a freeze, so a `liability_sum` run would delete a freeze an indexer-backed run had
-  just set — the check that could not fail also outranked the one that could.
+* **The loop is closed. What remains is a deploy step and a chain that has not launched.** This
+  bullet has twice described a gap it then had to correct, so the state is written out plainly.
 
-  Migration 11 makes `liability_sum` illegal for any asset in `chain_assets`, and a chain asset with
-  no reading now records `observed_source = 'unavailable'`, `NULL` totals and `status = 'failed'`.
-  The mechanism is landed and proved; the **feed is not**. Until `micro-indexer` exposes an
-  aggregate, EMBER fails every run and stays frozen. That is deliberate — the argument is on
-  `Env.reconcileAssets` (`src/env.ts`) and the operator lever is `LEDGER_RECONCILE_ASSETS`, not a
-  code exemption.
+  What was wrong: `reconcileAsset` selected `'liability_sum'` whenever no `indexerObservedTotal`
+  was passed, and **no production caller ever passed one**, so every run in the service's life
+  compared this ledger against itself. Worse than vacuous: `clean` is the status that *lifts* a
+  freeze, so a `liability_sum` run would delete a freeze an indexer-backed run had just set — the
+  check that could not fail also outranked the one that could.
+
+  What is now true: migration 11 makes `liability_sum` illegal for any asset in `chain_assets`;
+  `micro-indexer` serves the aggregate; and `src/jobs.ts` **makes the call**, through
+  `src/indexerclient.ts`, whose one rule is that unreachable arrives as `undefined` and never as
+  `0n`. `src/chainbacking.test.ts` drives the real `JobRunner` into that handler against the real
+  indexer server, a real `RpcPool` and a real JSON-RPC node, and breaks each guard in turn.
+
+  What is still outstanding, and neither piece is in this repository:
+
+  1. **The grant.** `INDEXER_SCOPES` is declared here and `derive-grants.mjs` now derives
+     `"ledger":["indexer:read"]`, but `micro-deploy` must regenerate
+     `IDENTITY_SERVICE_TOKEN_GRANTS`, mint `LEDGER_SERVICE_TOKEN` in `estate-bootstrap.sh` and pass
+     it to the container. Until it does, the call 401s — which is no observation, which freezes.
+  2. **The chain.** Hearth's mainnet has not launched, so the estate's indexer follows nothing and
+     the custody route answers `503 chain_not_followed`. EMBER therefore still fails every run and
+     stays frozen, and that is the honest answer rather than an inconvenience. The operator lever
+     is `LEDGER_RECONCILE_ASSETS`, not a code exemption; the argument is on `Env.reconcileAssets`.
 
   This bullet also asserted that wiring `micro-indexer` in "adds a caller, not a migration". **That
   was wrong**, and it is worth recording why: the run shape was indeed already the domain model's,
@@ -302,12 +325,15 @@ skipped** (`.github/workflows/ci.yml`), which is what stops a green run that pro
 
 * **Nothing verifies the observation itself, and no schema can.** `indexer_observed_total` is an
   assertion by whoever called the job. A caller that fabricates one is indistinguishable, in this
-  database, from one that read a chain. The constraints above refuse a run that never *had*
-  evidence; they cannot audit evidence they are handed. The requirements this puts on
-  `micro-indexer` — confirmed-only at `chainSpec(asset).confirmations`, and **incomplete coverage
-  must refuse rather than return a partial sum**, because a low total reads here as a positive drift
-  and freezes withdrawals on an RPC timeout — are written out at `src/jobs.ts` on the reconcile
-  handler.
+  database, from one that read a chain. The constraints refuse a run that never *had* evidence;
+  they cannot audit evidence they are handed. What this repository can do about it, and does, is
+  make the only caller a client with no path from a fault to a number.
+* **The custody set's completeness is asserted upstream, not proved.** The indexer sums the watched
+  addresses whose label marks them platform-held, and today `micro-wallet` registers `deposit:`
+  addresses while **nothing registers the `treasury:` addresses `micro-settlement` sweeps to**. A
+  swept deployment therefore under-reports, which reads here as positive drift and freezes — the
+  safe direction, and a real defect that belongs to the sweep rather than to this service. Reported
+  to `micro-settlement`.
 * **`/metrics` is unauthenticated** (`src/server.ts:331`). `micro-beacon` gates its equivalent and
   presents a token from Prometheus; this service does not, so anything that can reach the port can
   read `ledger_trial_balance_delta`, `ledger_reconciliation_drift` and the per-service posting
