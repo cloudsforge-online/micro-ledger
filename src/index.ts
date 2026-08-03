@@ -28,7 +28,8 @@ import { SERVICE, env } from './env.ts'
 import { SCHEMA_VERSION } from './migrations.ts'
 import { createServer, registerServiceMetrics } from './server.ts'
 import { registerHandlers, rescheduleRecurring, seedRecurring, type JobDeps } from './jobs.ts'
-import { httpIndexerClient, indexerChainFor } from './indexerclient.ts'
+import { indexerChainFor } from './indexerclient.ts'
+import { buildUpstreams } from './upstreams.ts'
 import { trialBalance } from './entries.ts'
 import { listFreezes } from './reconcile.ts'
 import type { Db } from './outbox.ts'
@@ -129,6 +130,18 @@ const server = createServer({
     }
 
     metrics.set('ledger_assets_frozen', (await listFreezes(sql as unknown as Db)).length)
+
+    // **Whether this process could authenticate to the indexer RIGHT NOW**, which is the question
+    // that had no answer anywhere in the estate while the ten-minute token was quietly dying inside
+    // a fifteen-minute job. Sampled from what the provider holds rather than by dialling identity:
+    // a probe that dialled would multiply the estate's readiness traffic by its replica count into
+    // the one service it can least afford to amplify a fault in, and would answer a question this
+    // process can already answer from memory.
+    //
+    // 0 with no credential configured at all, so the series exists in that deployment too — an
+    // absent metric is indistinguishable from a scrape that failed, and this is the one condition
+    // that must not be silent.
+    metrics.set('ledger_service_token_usable', identityTokens?.snapshot().hasUsableToken ? 1 : 0)
   },
 })
 
@@ -145,31 +158,69 @@ const server = createServer({
 //     it will freeze. A configuration whose effect is "this platform stops paying people" must not
 //     be discoverable only by noticing an absence.
 //     ══════════════════════════════════════════════════════════════════════════════════════════
+//     ══════════════════════════════════════════════════════════════════════════════════════════
+//     **AND THE CREDENTIAL IS EXCHANGED, NOT READ ONCE.** The line that used to be here was
+//
+//         token: () => env.indexerToken
+//
+//     — a function called per request, "so a future short-TTL credential needs no change here",
+//     returning a string read once at import from a token that expires in 600 seconds. This job
+//     runs every 900. So the chain-backing call authenticated once per bootstrap and never again,
+//     and every sweep after minute ten froze EMBER on an expired credential while writing exactly
+//     the row an honest "the chain could not be observed" failure writes.
+//
+//     The seam was right and the body was wrong, which is why the body now lives in
+//     `upstreams.ts` — a module a test can import without starting a server. That file carries the
+//     argument; this line is one call, deliberately.
+//     ══════════════════════════════════════════════════════════════════════════════════════════
 const chainBackedAssets = env.reconcileAssets.filter((asset) => indexerChainFor(asset) !== undefined)
-const indexer = env.indexerUrl
-  ? httpIndexerClient({
-      baseUrl: env.indexerUrl,
-      // Resolved per call rather than captured, so a future short-TTL credential needs no change
-      // here. Unset today in an estate whose grants have not yet been regenerated from
-      // `INDEXER_SCOPES`; that produces a 401, which produces a freeze, which is failing closed.
-      token: () => env.indexerToken,
-      deadlineMs: env.indexerDeadlineMs,
-      onResult: (event) => {
-        metrics.increment('ledger_indexer_calls_total', { outcome: event.outcome })
-        metrics.observe('ledger_indexer_duration_ms', event.durationMs)
-      },
-    })
-  : undefined
+const { identityTokens, indexer } = buildUpstreams(env, {
+  onEvent: (event) => {
+    metrics.increment('ledger_service_token_events_total', { kind: event.kind })
+    if (event.kind === 'minted') {
+      logger.info('minted a service token from the credential', {
+        service: event.service,
+        expiresIn: event.expiresIn,
+        refreshInMs: event.refreshInMs,
+      })
+    } else if (event.kind === 'exchange_failed') {
+      // `warn`, not `fatal`, and only because of `hadUsableToken`: a failed exchange while a live
+      // token is still held is the outage this provider is built to ride out, and paging on it
+      // would page on every identity blip. The consequence, if it persists, arrives on its own as
+      // a frozen asset whose run row says `no_credential`.
+      logger.warn('service credential exchange failed', { ...event })
+    }
+  },
+  onResult: (event) => {
+    metrics.increment('ledger_indexer_calls_total', { outcome: event.outcome })
+    metrics.observe('ledger_indexer_duration_ms', event.durationMs)
+  },
+})
 
 if (!indexer && chainBackedAssets.length > 0) {
   logger.fatal('NO INDEXER CONFIGURED — every chain-backed asset will freeze on its first sweep', {
     assets: chainBackedAssets,
     remedy: 'set INDEXER_URL, or remove these assets from LEDGER_RECONCILE_ASSETS deliberately',
   })
-} else if (indexer && !env.indexerToken && chainBackedAssets.length > 0) {
-  logger.fatal('NO INDEXER CREDENTIAL — the custody total demands indexer:read, so every chain-backed asset will freeze', {
+} else if (indexer && !identityTokens && chainBackedAssets.length > 0) {
+  logger.fatal('NO IDENTITY CREDENTIAL — the custody total demands indexer:read, so every chain-backed asset will freeze', {
     assets: chainBackedAssets,
-    remedy: 'set LEDGER_SERVICE_TOKEN; the grant is derived from INDEXER_SCOPES in src/indexerclient.ts',
+    remedy:
+      'set LEDGER_IDENTITY_CREDENTIAL (long-lived, from POST /service-credentials); the grant is derived from INDEXER_SCOPES in src/indexerclient.ts',
+    // Said out loud so the row an operator will find is the one they can search for.
+    runsWillRecord: 'observed_source=unavailable, unobserved_reason=no_credential',
+  })
+}
+
+// **The retired variable, detected only so that it can be complained about.** An operator who
+// redeploys with `LEDGER_SERVICE_TOKEN` and not `LEDGER_IDENTITY_CREDENTIAL` gets a service that
+// looks configured and is not — which is a quieter version of the defect the credential replaced,
+// and the estate has seen four of these on running containers already. It is never presented: this
+// is the only line in the service that reads it.
+if (env.legacyServiceTokenPresent) {
+  logger.error('LEDGER_SERVICE_TOKEN is set and is IGNORED', {
+    why: 'it held a 600-second token read once at boot, and the reconciliation job runs every 900 seconds',
+    remedy: 'remove it and set LEDGER_IDENTITY_CREDENTIAL, which is long-lived and is exchanged per token',
   })
 }
 

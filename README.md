@@ -220,7 +220,9 @@ test-only knob. A known placeholder value is refused at boot rather than accepte
 | `LEDGER_RECONCILE_NETWORK` | `testnet` | must be `mainnet` or `testnet`; recorded on every run row (`src/env.ts:168`) |
 | `INDEXER_URL` | — | where the chain half of the invariant is read from. **Optional, and unset is not a disabled check — it is a failing one:** with no client every `ON_CHAIN_ASSETS` member records `unavailable`/`failed` and freezes. Optional only because `src/migrator.ts` shares this env module and `ledger-migrate` is given no indexer, so demanding it would kill the container the estate's schema waits on. Must be an absolute `http`/`https` URL or boot fails, so `indexer:4000` names itself here rather than at the fifteen-minute mark (`src/env.ts`, `optionalUrl`) |
 | `LEDGER_INDEXER_DEADLINE_MS` | `5000` | integer 100–60000. **Bounds a job's lease as much as a request**: the handler holds its lease for the whole call, so a provider holding the socket open blocks the asset's next sweep |
-| `LEDGER_SERVICE_TOKEN` | — | the credential presented to the indexer. **Unset is a supported mode and it fails closed**: the call 401s, which is no observation, which freezes. Checked for placeholders and length when it *is* set. The grant is derived from `INDEXER_SCOPES` (`src/indexerclient.ts`) by `deploy/scripts/derive-grants.mjs`; a grant hand-added to compose fails that check |
+| `LEDGER_IDENTITY_CREDENTIAL` | — | **the long-lived credential this service exchanges for the tokens it presents to the indexer** (`cfsc_…`, `POST /service-tokens/exchange`). It **replaces `LEDGER_SERVICE_TOKEN`**, which held a *600-second* token read once at import while the reconciliation job runs every *900 seconds* — so the chain-backing call authenticated once per bootstrap and never again, and every later sweep froze EMBER on a 401 while writing byte-identical rows to the honest no-chain freeze. **Unset is a supported mode and it fails closed**, and since migration 12 it fails *legibly*: nothing is sent unauthenticated and the run records `unobserved_reason = 'no_credential'`. Optional because `src/migrator.ts` shares this env module and `ledger-migrate` is given no credential. The grant is derived from `INDEXER_SCOPES` (`src/indexerclient.ts`) by `deploy/scripts/derive-grants.mjs`; a grant hand-added to compose fails that check (`src/env.ts`, `src/upstreams.ts`) |
+| `IDENTITY_URL` | `IDENTITY_ISSUER` | where the credential exchange is dialled. Derived rather than demanded, because a deployment that exchanged against one identity and trusted the JWKS of another fails with a signature error nobody reads as a configuration mistake |
+| `LEDGER_SERVICE_TOKEN` | — | **retired**. Read for one purpose: an `ERROR` at boot saying it is set and is IGNORED. An operator who redeploys with the old variable and not the new one otherwise gets a service that looks configured and is not (`src/index.ts`) |
 | `LEDGER_IDEMPOTENCY_TTL_DAYS` | `30` | **expiring a key early means the next replay does the work a second time**, so this must outlive every caller's retry horizon rather than be as short as the table would like (`src/env.ts:195`, reasoning at `:148-152`) |
 | `LEDGER_TEST_DATABASE_URL` | — | tests only. Unset, every database-backed test **skips**; the database name must contain `test` because the suite truncates |
 
@@ -307,16 +309,47 @@ skipped** (`.github/workflows/ci.yml`), which is what stops a green run that pro
   `0n`. `src/chainbacking.test.ts` drives the real `JobRunner` into that handler against the real
   indexer server, a real `RpcPool` and a real JSON-RPC node, and breaks each guard in turn.
 
-  What is still outstanding, and neither piece is in this repository:
+  **The grant landed, and then the credential behind it expired every ten minutes.**
+  `derive-grants.mjs` derived `"ledger":["indexer:read"]`, `estate-bootstrap.sh` minted
+  `LEDGER_SERVICE_TOKEN`, and the loop went clean once — against a real EMBER testnet, `indexer` as
+  the observed source, drift exactly 0 over 31 EMBER. Then it broke, permanently and invisibly:
 
-  1. **The grant.** `INDEXER_SCOPES` is declared here and `derive-grants.mjs` now derives
-     `"ledger":["indexer:read"]`, but `micro-deploy` must regenerate
-     `IDENTITY_SERVICE_TOKEN_GRANTS`, mint `LEDGER_SERVICE_TOKEN` in `estate-bootstrap.sh` and pass
-     it to the container. Until it does, the call 401s — which is no observation, which freezes.
-  2. **The chain.** Hearth's mainnet has not launched, so the estate's indexer follows nothing and
-     the custody route answers `503 chain_not_followed`. EMBER therefore still fails every run and
-     stays frozen, and that is the honest answer rather than an inconvenience. The operator lever
-     is `LEDGER_RECONCILE_ASSETS`, not a code exemption; the argument is on `Env.reconcileAssets`.
+  > `LEDGER_SERVICE_TOKEN` was a **600-second** token (`identity/src/tokens.ts:28`) read once at
+  > import. The reconciliation job runs every **900 seconds** (`src/jobs.ts`). 600 < 900, so the
+  > chain-backing call authenticated for the first sweep after a bootstrap and for no sweep after
+  > that, ever — and the resulting freeze was **byte-identical** to the honest "the chain could not
+  > be observed" freeze. A guarantee built to stop the ledger lying to itself was reporting a
+  > true-shaped fact for a false reason, and the row, the log line and the event were the same
+  > either way.
+
+  Both halves of that are now fixed here:
+
+  1. **The service holds a credential and mints its own tokens.** `LEDGER_IDENTITY_CREDENTIAL` is
+     long-lived and revocable; `@cloudsforge/auth`'s `ServiceTokenProvider` exchanges it at
+     `POST /service-tokens/exchange` and re-mints at ~80% of each token's life, jittered so replicas
+     do not stampede. The wiring is `src/upstreams.ts` — a module rather than twenty lines of
+     `index.ts`, because wiring in a composition root is wiring no test can reach.
+     `src/servicetoken.test.ts` moves a simulated clock eleven minutes past a token the process
+     holds, proves that token is refused by a real `Verifier`, and then drives the real job through
+     `buildUpstreams` to a clean observed run. **The ten minutes is deliberately unchanged** —
+     rotation IS expiry.
+  2. **An unobserved run records WHY.** Migration 12 adds `unobserved_reason` and refuses an
+     `unavailable` run without one. `no_credential` and `unauthorized` are faults in this platform;
+     `indexer_error` is the indexer saying it cannot see the chain. `asset_freezes.reason`,
+     `GET /reconciliation`, the `ledger.reconciliation.completed` payload and
+     `ledger_reconciliation_unobserved_total{reason=…}` all carry it.
+
+  What is still outstanding, and it is not in this repository:
+
+  - **`micro-deploy` must hand ledger the credential.** `estate-bootstrap.sh` already mints
+    `LEDGER_IDENTITY_CREDENTIAL`; `docker-compose.estate.yml` passes `LEDGER_SERVICE_TOKEN` and not
+    that. Until it is swapped, this service boots, logs `NO IDENTITY CREDENTIAL` at fatal plus
+    `LEDGER_SERVICE_TOKEN is set and is IGNORED` at error, and freezes EMBER with
+    `unobserved_reason = 'no_credential'` — which is failing closed, and now says so.
+  - **The chain.** Where no Hearth node is followed the custody route answers
+    `503 chain_not_followed`, the run records `indexer_error`, and the asset stays frozen. That is
+    the honest answer rather than an inconvenience. The operator lever is `LEDGER_RECONCILE_ASSETS`,
+    not a code exemption; the argument is on `Env.reconcileAssets`.
 
   This bullet also asserted that wiring `micro-indexer` in "adds a caller, not a migration". **That
   was wrong**, and it is worth recording why: the run shape was indeed already the domain model's,

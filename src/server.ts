@@ -138,6 +138,47 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
       kind: 'gauge',
       labels: ['asset'],
     })
+    /**
+     * **The series that tells the two freezes apart, and the one whose absence let a defect hide.**
+     *
+     * `ledger_reconciliation_observed` going to 0 was the only signal an unobserved run produced,
+     * and it fired identically for two states that need opposite responses: "Hearth has not
+     * launched, so nothing can be observed" — expected, argued for in `env.ts`, and not a page —
+     * and "this service's 600-second token expired inside a 900-second job", which is a page and
+     * which the estate sat in for the life of the service. A counter labelled by reason is what
+     * lets an alert fire on `no_credential` and `unauthorized` while staying quiet on
+     * `indexer_error`.
+     *
+     * A counter rather than a gauge: the question is "how often, and has it started", not "what is
+     * it now" — and unlike a gauge it does not hold a stale value once observation recovers.
+     * Cardinality is bounded by `UnobservedReason`, which is a closed union of eight strings.
+     */
+    .register({
+      name: 'ledger_reconciliation_unobserved_total',
+      help: 'Reconciliation runs that observed nothing, by asset and by WHY. `no_credential` and `unauthorized` are faults in this platform, not in the chain.',
+      kind: 'counter',
+      labels: ['asset', 'reason'],
+    })
+    /**
+     * Whether this process holds a service token it could present right now.
+     *
+     * The one number that would have made the ten-minute cliff visible from outside: it goes to 0
+     * ten minutes after boot in a deployment that reads a token from a variable, and stays at 1 in
+     * one that exchanges a credential. Sampled at scrape time from the provider's own snapshot —
+     * see `index.ts`'s `beforeScrape` — never by dialling identity.
+     */
+    .register({
+      name: 'ledger_service_token_usable',
+      help: '1 if this replica holds a service token it can present to the indexer, 0 if it does not — including when no credential is configured',
+      kind: 'gauge',
+      labels: [],
+    })
+    .register({
+      name: 'ledger_service_token_events_total',
+      help: 'ServiceTokenProvider events: minted, exchange_failed, reminted_after_401, replay_skipped',
+      kind: 'counter',
+      labels: ['kind'],
+    })
     .register({
       name: 'ledger_assets_frozen',
       help: 'Assets whose withdrawals are frozen by reconciliation drift',

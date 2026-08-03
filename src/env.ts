@@ -70,10 +70,15 @@ function optional(source: Source, name: string, fallback: string): string {
   return value && value.length > 0 ? value : fallback
 }
 
-/** Absent is a supported mode; present-but-rubbish is not. */
-function optionalSecret(source: Source, name: string, minLength = 24): string | undefined {
+/**
+ * Absent is a supported mode; present-but-rubbish is not.
+ *
+ * `null` rather than `undefined` for absence, so the field it fills is a value a caller must
+ * handle rather than a key that may or may not be there. `buildUpstreams` branches on it directly.
+ */
+function optionalSecret(source: Source, name: string, minLength = 24): string | null {
   const value = source[name]?.trim()
-  if (!value) return undefined
+  if (!value) return null
   return requiredSecret(source, name, minLength)
 }
 
@@ -160,6 +165,18 @@ export interface Env {
   readonly databasePoolMax: number
   readonly identityJwksUrl: string
   readonly identityIssuer: string
+  /**
+   * Where identity is, for `POST /service-tokens/exchange`.
+   *
+   * Defaults to `IDENTITY_ISSUER`, which is already required and is identity's own base URL — the
+   * issuer of a token is by definition where the token came from. `IDENTITY_URL` overrides it for a
+   * deployment where the two genuinely differ (an issuer behind a public name, dialled internally).
+   * Deriving rather than demanding a fourth identity variable keeps the two in step: a deployment
+   * that exchanged against one identity and trusted the JWKS of another would fail with a signature
+   * error nobody would read as a configuration mistake. Copied from wallet, which is the reference
+   * adoption of `ServiceTokenProvider`.
+   */
+  readonly identityUrl: string
   /** HMAC key for outbound event signatures, so a subscriber can prove an event came from us. */
   readonly outboxSigningSecret: string
   readonly instanceId: string
@@ -244,20 +261,51 @@ export interface Env {
    */
   readonly indexerDeadlineMs: number
   /**
-   * The credential presented to the indexer. **Optional, and unset is a supported mode.**
+   * **The long-lived credential this service exchanges for the short-lived tokens it presents to
+   * the indexer.** Optional, and unset is a supported mode.
    *
-   * The custody route is the one read on that service demanding `indexer:read`, and this service
-   * is granted it only once `derive-grants.mjs` has read `INDEXER_SCOPES` out of
-   * `src/indexerclient.ts` and regenerated `IDENTITY_SERVICE_TOKEN_GRANTS`. Between those two
-   * events a deployment has the URL and no token, and the honest behaviour is to make the call,
-   * get a 401, map it to no observation, and freeze — which is exactly what happens. Refusing to
-   * boot instead would trade a frozen asset for a dead ledger, and the ledger is what serves every
-   * balance in the estate.
+   * ════════════════════════════════════════════════════════════════════════════════════════════
+   * **IT REPLACES `LEDGER_SERVICE_TOKEN`, AND THE REPLACEMENT IS THE WHOLE POINT.**
    *
-   * Checked for placeholders and length when it IS set, like every other secret here, so the mode
-   * that is supported is "absent" rather than "absent or rubbish".
+   * That variable held a **600-second** token (`identity/src/tokens.ts:28`), read once at import,
+   * and the reconciliation job runs every **900 seconds** (`jobs.ts:recurringJobs`). So the chain
+   * half of the solvency invariant authenticated exactly once per bootstrap and never again: from
+   * minute ten onwards every sweep got a 401, every 401 mapped to `undefined`, every `undefined`
+   * recorded `unavailable` / `failed`, and EMBER froze — while producing **byte-identical output**
+   * to the honest "no chain could be observed" freeze this service is designed to produce.
+   *
+   * That is worse than a broken check. It is a check whose failure mode is indistinguishable from
+   * its correct pessimistic answer, so the freeze could not be read, and an operator following the
+   * `unavailable` line would go looking at a chain that was fine.
+   *
+   * A credential is not a token. It confers nothing by itself, it is revocable, it survives a
+   * restart, and `@cloudsforge/auth`'s `ServiceTokenProvider` exchanges it at
+   * `POST /service-tokens/exchange` for an ordinary ten-minute token, re-minting at ~80% of its
+   * life. **The ten minutes is deliberately unchanged** — rotation IS expiry.
+   *
+   * ── WHY IT IS STILL OPTIONAL, AND WHY THAT IS NOT THE SAME MISTAKE ────────────────────────────
+   *
+   * `src/migrator.ts` imports this module, so `ledger-migrate` validates this environment too and
+   * is given `LEDGER_DATABASE_URL` and `OUTBOX_SIGNING_SECRET` and nothing else. `requiredSecret`
+   * here would exit 1 and take the estate's schema with it — the same argument that keeps
+   * `indexerUrl` optional, and the same one wallet makes for its CI `/livez` smoke test.
+   *
+   * Absence fails closed and fails *legibly*, which is the difference from before: no credential
+   * means the token supplier rejects with `ServiceTokenUnavailableError`, the call is never sent
+   * unauthenticated, and the run records `unavailable` with `unobserved_reason = 'no_credential'`
+   * — a different row from a chain that could not be observed. `index.ts` also says so at boot.
+   * ════════════════════════════════════════════════════════════════════════════════════════════
    */
-  readonly indexerToken: string | undefined
+  readonly identityCredential: string | null
+  /**
+   * Whether the retired `LEDGER_SERVICE_TOKEN` is still set.
+   *
+   * Read for exactly one purpose: to say so at boot. An operator who redeploys with the old
+   * variable and not the new one would otherwise get a service that looks configured and is not —
+   * which is a slower, quieter version of the very defect the credential was introduced to fix.
+   * wallet, worlds, mint, nda, billing and hub-api each carry the same field for the same reason.
+   */
+  readonly legacyServiceTokenPresent: boolean
   /**
    * How long an idempotency key is honoured. Expiring one EARLY means the next replay of it does
    * the work a second time, so the TTL must outlive every caller's retry horizon rather than be
@@ -300,6 +348,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     databasePoolMax: integer(source, 'LEDGER_DATABASE_POOL_MAX', 10, 1, 500),
     identityJwksUrl: required(source, 'IDENTITY_JWKS_URL'),
     identityIssuer: required(source, 'IDENTITY_ISSUER'),
+    identityUrl: optional(source, 'IDENTITY_URL', required(source, 'IDENTITY_ISSUER')),
     outboxSigningSecret: requiredSecret(source, 'OUTBOX_SIGNING_SECRET'),
     instanceId: optional(source, 'INSTANCE_ID', host || 'unknown'),
     assetTolerance: parseAssetTolerance(optional(source, 'LEDGER_ASSET_TOLERANCE', '{}')),
@@ -307,7 +356,11 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     reconcileNetwork: network,
     indexerUrl: optionalUrl(source, 'INDEXER_URL'),
     indexerDeadlineMs: integer(source, 'LEDGER_INDEXER_DEADLINE_MS', 5_000, 100, 60_000),
-    indexerToken: optionalSecret(source, 'LEDGER_SERVICE_TOKEN'),
+    // Not `requiredSecret`: see the field comment. The absence is caught by a reconciliation run
+    // that names it, which is a check that can fail, rather than by a boot `ledger-migrate` cannot
+    // perform.
+    identityCredential: optionalSecret(source, 'LEDGER_IDENTITY_CREDENTIAL'),
+    legacyServiceTokenPresent: (source['LEDGER_SERVICE_TOKEN']?.trim() ?? '').length > 0,
     idempotencyTtlDays: integer(source, 'LEDGER_IDEMPOTENCY_TTL_DAYS', 30, 1, 3_650),
   }
 }

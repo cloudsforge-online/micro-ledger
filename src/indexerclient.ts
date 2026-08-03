@@ -29,6 +29,35 @@
  * backing nobody can see is an asset nobody should be able to withdraw. What must never happen is
  * the other thing, and the other thing is one `?? 0n` away.
  *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * ## THE SECOND RULE, ADDED AFTER A FREEZE THAT COULD NOT BE READ
+ *
+ * **THE ANSWER IS STILL "NOBODY LOOKED". THE RUN MUST ALSO RECORD *WHY* NOBODY LOOKED.**
+ *
+ * The paragraph above used to end "there is deliberately no branch here that distinguishes them",
+ * and as a rule about the ANSWER that is still exactly right and is enforced below. As a rule
+ * about the DIAGNOSIS it was wrong, and the estate paid for it:
+ *
+ *   `LEDGER_SERVICE_TOKEN` was a 600-second token read once at boot; the reconciliation job runs
+ *   every 900 seconds. From minute ten of every deployment the custody call 401'd, mapped to
+ *   `undefined`, recorded `unavailable` / `failed` and froze EMBER — **producing byte-identical
+ *   rows, logs and events to the honest "Hearth has not launched, so nothing can be observed"
+ *   freeze this file was written to produce.** A guarantee built to stop the ledger lying to itself
+ *   was reporting a true-shaped fact for a false reason, and no operator could have told.
+ *
+ * `env.ts` fixes the cause — the service now holds a credential and mints its own tokens. This
+ * fixes the legibility, which is a separate defect and outlives the first one: an expired token is
+ * only one of the ways authentication fails, and the next one will be silent again unless the row
+ * says which happened.
+ *
+ * So `observe()` returns the same `bigint | undefined` **plus** an `UnobservedReason`, and the two
+ * come from structurally separate places: `total` is assigned in exactly one statement, from
+ * `totalFrom`, and `reasonFor` is a pure function of a caught error that **cannot see or produce a
+ * number**. That separation is the guard the old comment was really asking for. Adding a branch
+ * that could return a number is still forbidden; adding a branch that says why there is none is
+ * what an operator needs at three in the morning.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ *
  * The properties above are not asserted only here. They were specified and proved against a real
  * socket, a real indexer and a real chain in `indexer/src/chainbacking.test.ts` before this file
  * existed — that file's `observedTotalFor` is this function's reference implementation — and
@@ -63,7 +92,8 @@
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  */
 
-import { HttpClient, type ResultEvent } from '@cloudsforge/http'
+import { CircuitOpenError, HttpClient, HttpError, TimeoutError, type ResultEvent } from '@cloudsforge/http'
+import { ServiceTokenUnavailableError } from '@cloudsforge/auth'
 import type { LiveScope } from '@cloudsforge/contracts-auth'
 import { ON_CHAIN_ASSETS, type Network } from '@cloudsforge/contracts-chain'
 
@@ -114,15 +144,81 @@ const ON_CHAIN_SLUGS: ReadonlyMap<string, string> = new Map(
   (ON_CHAIN_ASSETS as readonly string[]).map((code) => [code, code.toLowerCase()]),
 )
 
+/**
+ * Why a run has no observation. **A diagnosis, never an answer** — nothing downstream may treat any
+ * of these as a number, and `reconcileAsset` records the same NULL total and the same `failed`
+ * status for every one of them.
+ *
+ * The set is chosen so that each value sends an operator to a different place on the first read.
+ * The split that matters most, and the one this whole change exists for, is the first group against
+ * the last two: **`no_credential` and `unauthorized` are faults in THIS platform's authentication.
+ * `indexer_error` is the indexer saying it cannot see the chain.** Those were one row.
+ *
+ *   * `not_configured`      — no `INDEXER_URL` in this deployment. Nothing was dialled. Deploy fix.
+ *   * `no_credential`       — this process could not obtain a service token at all: no
+ *                             `LEDGER_IDENTITY_CREDENTIAL`, identity unreachable, or identity
+ *                             refusing the exchange. **The request was never sent**, deliberately —
+ *                             sending it unauthenticated would come back 401 and blame the indexer.
+ *   * `unauthorized`        — a token was presented and the indexer refused it (401/403), and the
+ *                             provider had already re-minted and replayed once. That is a GRANT
+ *                             problem: `indexer:read` derived from `INDEXER_SCOPES` below.
+ *   * `timeout`             — the deadline ended the call. The indexer may be healthy and slow.
+ *   * `unreachable`         — no HTTP answer at all: refused connection, DNS, an open circuit.
+ *   * `indexer_error`       — the indexer answered 5xx. **This is where the honest "the chain could
+ *                             not be observed" lives**: the estate's route answers 503
+ *                             `chain_not_followed` when no node is followed for the asset.
+ *   * `indexer_refused`     — a non-auth 4xx. We asked something it will not answer: an unknown
+ *                             chain slug, a network it does not carry.
+ *   * `unusable_answer`     — a 200 whose body is not a decimal-string total. Either a version skew
+ *                             or something that is not the indexer on the far end of that URL.
+ */
+export const UNOBSERVED_REASONS = Object.freeze([
+  'not_configured',
+  'no_credential',
+  'unauthorized',
+  'timeout',
+  'unreachable',
+  'indexer_error',
+  'indexer_refused',
+  'unusable_answer',
+] as const)
+
+/**
+ * Derived from the array rather than declared beside it, so the list a test enumerates and the type
+ * the compiler enforces are the same object. Two declarations would drift, and the drift would be
+ * invisible: a reason the schema had never been shown to accept would abort the reconciliation
+ * transaction — on the estate's solvency check — the first time it was produced.
+ */
+export type UnobservedReason = (typeof UNOBSERVED_REASONS)[number]
+
+/**
+ * One attempt to read the chain half of the invariant.
+ *
+ * The two fields are exclusive by construction — `total` is present exactly when `reason` is `null`
+ * — and they are built in separate statements from separate inputs so that no future edit can make
+ * a reason produce a total. See the header.
+ */
+export interface Observation {
+  /** `undefined` means **no observation**, for any reason whatsoever. It never means zero. */
+  readonly total: bigint | undefined
+  /** `null` exactly when `total` is a number. */
+  readonly reason: UnobservedReason | null
+}
+
 export interface IndexerClientOptions {
   readonly baseUrl: string
   /**
    * The service token, resolved per call.
    *
    * A function rather than a string so a short-TTL credential can be refreshed without rebuilding
-   * the client. **May resolve to `undefined`**, and that case is not an error here: an unauthorised
-   * call gets a 401, which maps to `undefined`, which freezes. See `env.ts` on why a missing token
-   * must not stop this service booting.
+   * the client — and since `upstreams.ts` this is `ServiceTokenProvider.token`, which mints one
+   * from a long-lived credential and re-mints at ~80% of its life. That is what stops the fifteen-
+   * minute sweep meeting a ten-minute token.
+   *
+   * **May resolve to `undefined`**, and that case is not an error here: an unauthorised call gets a
+   * 401, which is `unauthorized`, which freezes. It may also **reject** — `ServiceTokenUnavailable
+   * Error` when there is no credential or identity is down — and that is `no_credential`, with no
+   * request sent. Neither may stop this service booting: see `env.ts`.
    */
   readonly token: () => Promise<string | undefined> | string | undefined
   /** Absolute wall-clock ceiling on the whole call, including connect. */
@@ -132,6 +228,14 @@ export interface IndexerClientOptions {
 }
 
 export interface IndexerClient {
+  /**
+   * Σ confirmed native balance over the indexer's custody set, in the asset's smallest units, and
+   * — when there is none — why not.
+   *
+   * This is what `jobs.ts` calls. `observedTotalFor` below is the same call with the diagnosis
+   * discarded, kept because it is the shape the contract is stated and proved in.
+   */
+  observe(chain: string, network: Network): Promise<Observation>
   /**
    * Σ confirmed native balance over the indexer's custody set, in the asset's smallest units.
    *
@@ -181,26 +285,68 @@ export function httpIndexerClient(options: IndexerClientOptions): IndexerClient 
     ...(options.onResult ? { onResult: options.onResult } : {}),
   })
 
-  return {
-    async observedTotalFor(chain, network) {
+  const self: IndexerClient = {
+    async observe(chain, network) {
       let body: unknown
       try {
         body = await client.get<unknown>(
           `/v1/custody/${encodeURIComponent(chain)}/${encodeURIComponent(network)}/total`,
           { retries: 0 },
         )
-      } catch {
-        // Every failure, without exception and without inspection: a timeout, a refused
-        // connection, DNS, a 401, a 403, a 503 with a fault code, a body that is not JSON, an open
-        // circuit, a 2xx that is not 200. There is deliberately no branch here that distinguishes
-        // them, because every branch that could be added is a branch that could return a number.
-        // The DIAGNOSIS is the indexer's fault code and this client's `onResult` event, both of
-        // which reach an operator; the ANSWER is "nobody looked".
-        return undefined
+      } catch (err) {
+        // Every failure, without exception: a timeout, a refused connection, DNS, a 401, a 403, a
+        // 503 with a fault code, a body that is not JSON, an open circuit, a 2xx that is not 200.
+        // **There is still no branch here that can produce a number** — this `return` is the only
+        // statement in the function reachable from a caught error, and it is a literal `undefined`.
+        // `reasonFor` is handed the error and can answer with one of eight strings; it never sees
+        // the body and has no path to `totalFrom`.
+        return { total: undefined, reason: reasonFor(err) }
       }
-      return totalFrom(body)
+      // The one statement in this module that yields a number, and `totalFrom` is the only thing
+      // that decides. `undefined` here means a 200 arrived and was not a total — a different fact
+      // from every case above, and one an operator diagnoses at the indexer rather than at identity.
+      const total = totalFrom(body)
+      return total === undefined ? { total: undefined, reason: 'unusable_answer' } : { total, reason: null }
+    },
+
+    async observedTotalFor(chain, network) {
+      return (await self.observe(chain, network)).total
     },
   }
+  return self
+}
+
+/**
+ * The diagnosis, and **only** the diagnosis.
+ *
+ * Pure, total, and typed to return `UnobservedReason` — a string union with no numeric member — so
+ * the compiler enforces the property the header claims: nothing in this function can become a
+ * total. It is exported so the tests can enumerate its cases without a socket, and driven over real
+ * sockets by `chainbacking.test.ts`.
+ *
+ * Order matters once: `ServiceTokenUnavailableError` is checked FIRST. It is thrown by the token
+ * supplier inside `HttpClient`'s attempt, so it arrives as an ordinary rejection with no status and
+ * would otherwise fall through to `unreachable` — reporting the indexer as unreachable when the
+ * request was never sent and the fault is identity's. That misattribution is a smaller copy of the
+ * one this whole change exists to remove.
+ */
+export function reasonFor(err: unknown): UnobservedReason {
+  if (err instanceof ServiceTokenUnavailableError) return 'no_credential'
+  if (err instanceof TimeoutError) return 'timeout'
+  if (err instanceof CircuitOpenError) return 'unreachable'
+  if (err instanceof HttpError) {
+    // `HttpClient` reuses `HttpError` for "a 2xx whose body would not parse as JSON", carrying the
+    // SUCCESSFUL status. Without this line that lands in the `!peerDecided` bucket and is reported
+    // as a server error, sending an operator to the indexer's logs for something the indexer
+    // considers a success. It is the same fact as a body that parses and is not a total.
+    if (err.status < 400) return 'unusable_answer'
+    if (err.status === 401 || err.status === 403) return 'unauthorized'
+    return err.peerDecided ? 'indexer_refused' : 'indexer_error'
+  }
+  // A `fetch` that rejected: ECONNREFUSED, DNS, a socket hang-up, or `NotExactly200Error` above —
+  // which is a peer answering something that is not an answer, and is reported as such.
+  if (err instanceof NotExactly200Error) return 'unusable_answer'
+  return 'unreachable'
 }
 
 /**

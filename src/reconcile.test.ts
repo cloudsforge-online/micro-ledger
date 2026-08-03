@@ -21,6 +21,7 @@ import type postgres from 'postgres'
 import { AssetFrozenError, postEntry, type PostEntryDeps } from './entries.ts'
 import { requestFingerprint } from './idempotency.ts'
 import { RECONCILIATION_COMPLETED, listFreezes, latestRuns, reconcileAsset } from './reconcile.ts'
+import { UNOBSERVED_REASONS } from './indexerclient.ts'
 import { topicSpec } from '@cloudsforge/contracts-events'
 import { ON_CHAIN_ASSETS } from '@cloudsforge/contracts-chain'
 import { KEYED_BY, envelopeDefects } from './topics.ts'
@@ -478,8 +479,23 @@ test('SCHEMA: a platform asset is NOT caught by the chain rule', { skip }, async
   )
 })
 
+/**
+ * An unobserved row, complete under migration 12.
+ *
+ * `unobserved_reason` belongs to the fixture rather than to each case, so the tests below still
+ * fail for the constraint they NAME. Without it every one of them would trip
+ * `reconciliation_runs_reason_chk` first and pass while proving nothing about the rule it was
+ * written for — a suite going green on the wrong constraint, which is precisely the failure this
+ * area of the schema exists to prevent.
+ */
+const unobserved = {
+  observed_source: 'unavailable',
+  indexer_observed_total: null,
+  drift: null,
+  unobserved_reason: 'indexer_error',
+}
+
 test('SCHEMA: an unobserved run may not be clean — absence of evidence is not evidence', { skip }, async () => {
-  const unobserved = { observed_source: 'unavailable', indexer_observed_total: null, drift: null }
   for (const status of ['clean', 'drift_within_tolerance', 'drift_exceeded']) {
     await refuses({ ...unobserved, status }, /unobserved_failed/)
   }
@@ -489,17 +505,65 @@ test('SCHEMA: an unobserved run may not be clean — absence of evidence is not 
 
 test('SCHEMA: an unknown is recorded as unknown, and may not be laundered into a zero', { skip }, async () => {
   // The defect this release removes, in its purest form: no observation, written down as 0.
-  await refuses(
-    { observed_source: 'unavailable', indexer_observed_total: '0', drift: '0', status: 'failed' },
-    /unobserved_chk/,
-  )
+  await refuses({ ...unobserved, indexer_observed_total: '0', drift: '0', status: 'failed' }, /unobserved_chk/)
   // And the mirror — a NULL total under a source that claims one was obtained.
   await refuses({ observed_source: 'indexer', indexer_observed_total: null, drift: null }, /unobserved_chk/)
   // A drift stated beside an absent observation: 0 − nothing is not 0.
+  await refuses({ ...unobserved, drift: '0', status: 'failed' }, /drift_chk/)
+})
+
+/* ────────────────────────────────────────────────────────────────────────────────────────────────
+ * MIGRATION 12 — AN UNOBSERVED RUN MUST SAY WHY.
+ *
+ * Migration 11 made "nobody observed this" recordable and every column above is correct. What it
+ * could not record is the difference between an unlaunched chain — EMBER's honest, expected state
+ * — and this service failing to authenticate, which is what actually happened for the life of the
+ * service: a 600-second token read once at boot, inside a job that runs every 900 seconds. Both
+ * wrote `unavailable` / NULL / NULL / `failed`. One of them is a page.
+ * ──────────────────────────────────────────────────────────────────────────────────────────────── */
+
+test('SCHEMA: an unobserved run must state a reason — the freeze that could not be read', { skip }, async () => {
+  await refuses({ ...unobserved, unobserved_reason: null, status: 'failed' }, /reason_chk/)
+
+  // The mirror, and it is not decoration. A run that DID observe may not carry a reason: a row
+  // asserting both "the indexer answered" and "nobody could authenticate" is one a dashboard would
+  // render either way round, and whichever it chose would be wrong half the time.
+  await refuses({ observed_source: 'indexer', unobserved_reason: 'no_credential' }, /reason_chk/)
   await refuses(
-    { observed_source: 'unavailable', indexer_observed_total: null, drift: '0', status: 'failed' },
-    /drift_chk/,
+    {
+      asset_code: 'SHARD',
+      chain: 'platform',
+      observed_source: 'liability_sum',
+      unobserved_reason: 'timeout',
+    },
+    /reason_chk/,
   )
+})
+
+test('SCHEMA: the reason is a token, never a message an error carried', { skip }, async () => {
+  // The column is read by dashboards and is interpolated into `asset_freezes.reason`, which is
+  // served over HTTP by GET /reconciliation. A raw error message reaching it could carry a URL, a
+  // query string or a bearer — so the SHAPE is constrained even though the vocabulary deliberately
+  // is not (migration 12 argues why).
+  for (const bad of [
+    'could not exchange the service credential: identity refused 401',
+    'HTTP://INDEXER:4000/v1/custody?token=abc',
+    'no',
+    '',
+    'a_reason_far_longer_than_the_thirty_two_characters_allowed',
+  ]) {
+    await refuses({ ...unobserved, unobserved_reason: bad, status: 'failed' }, /reason_shape_chk/)
+  }
+
+  // And every member of the union `indexerclient.ts` can actually produce is accepted, so the shape
+  // rule can never refuse a diagnosis this service is capable of making — which would abort the
+  // reconciliation transaction and dead-letter the estate's solvency check.
+  for (const reason of UNOBSERVED_REASONS) {
+    await assert.doesNotReject(
+      () => rawRun({ ...unobserved, unobserved_reason: reason, status: 'failed' }),
+      `the schema refuses ${reason}, which indexerclient.ts can produce`,
+    )
+  }
 })
 
 /**

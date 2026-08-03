@@ -78,3 +78,52 @@ test('the reconciled asset list must not be empty', () => {
 test('LOG_LEVEL is a closed set', () => {
   assert.throws(() => loadEnv({ ...BASE, LOG_LEVEL: 'verbose' }), /LOG_LEVEL must be one of/)
 })
+
+/* ────────────────────────────────────────────────────────────────────────────────────────────────
+ * THE CREDENTIAL. It replaced a 600-second token read once at import, inside a job that runs every
+ * 900 seconds.
+ * ──────────────────────────────────────────────────────────────────────────────────────────────── */
+
+test('the identity credential is OPTIONAL, because `ledger-migrate` shares this env module', () => {
+  // `src/migrator.ts` imports `./env.ts`, and the one-shot container every other ledger container
+  // waits on is given LEDGER_DATABASE_URL and OUTBOX_SIGNING_SECRET and nothing else. Making this
+  // `requiredSecret` would exit 1 and take the estate's schema with it — the same argument that
+  // keeps INDEXER_URL optional. The absence is not silent: it is a boot line, a gauge, and
+  // `unobserved_reason = 'no_credential'` on the run that freezes the asset.
+  assert.equal(loadEnv(BASE).identityCredential, null)
+  assert.doesNotThrow(() => loadEnv(BASE))
+})
+
+test('absent is a supported mode; present-but-rubbish is not', () => {
+  const good = 'cfsc_5ntCPqB0ZQ3xk1r-8LHYyU2eWvJfA6oMdT4siGXn9Kc'
+  assert.equal(loadEnv({ ...BASE, LEDGER_IDENTITY_CREDENTIAL: good }).identityCredential, good)
+  assert.throws(() => loadEnv({ ...BASE, LEDGER_IDENTITY_CREDENTIAL: 'changeme' }), /known placeholder/)
+  assert.throws(() => loadEnv({ ...BASE, LEDGER_IDENTITY_CREDENTIAL: 'cfsc_short' }), /at least 24 characters/)
+})
+
+test('the exchange is dialled at IDENTITY_ISSUER unless IDENTITY_URL says otherwise', () => {
+  // Derived rather than demanded as a fourth identity variable: the issuer of a token is by
+  // definition where the token came from, and a deployment that exchanged against one identity
+  // while trusting the JWKS of another would fail with a signature error nobody reads as a
+  // configuration mistake.
+  assert.equal(loadEnv(BASE).identityUrl, VALID['IDENTITY_ISSUER'])
+  assert.equal(
+    loadEnv({ ...BASE, IDENTITY_URL: 'http://identity:4000' }).identityUrl,
+    'http://identity:4000',
+  )
+})
+
+test('the retired LEDGER_SERVICE_TOKEN is DETECTED and never used', () => {
+  // Read for exactly one purpose: `index.ts` logs an ERROR saying it is set and is IGNORED. An
+  // operator who redeploys with the old variable and not the new one would otherwise get a service
+  // that looks configured and is not — a quieter version of the defect the credential replaced.
+  const withLegacy = loadEnv({ ...BASE, LEDGER_SERVICE_TOKEN: 'eyJhbGciOiJSUzI1NiIsImtpZCI6IjdiNjY1YyJ9.x.y' })
+  assert.equal(withLegacy.legacyServiceTokenPresent, true)
+  // And it does NOT become the credential. Presenting a token where a credential belongs is the
+  // ten-minute cliff wearing the fix's clothes.
+  assert.equal(withLegacy.identityCredential, null)
+  assert.equal(loadEnv(BASE).legacyServiceTokenPresent, false)
+  // A legacy token that is also rubbish must not stop the service booting: it is ignored, so it
+  // cannot be a reason to refuse a configuration that is otherwise complete.
+  assert.doesNotThrow(() => loadEnv({ ...BASE, LEDGER_SERVICE_TOKEN: 'changeme' }))
+})

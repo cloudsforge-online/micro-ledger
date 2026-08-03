@@ -143,6 +143,7 @@ async function runReconcileJob(
 /** The row as the database actually holds it. The constraints are half of what is being proved. */
 async function lastRun(): Promise<{
   observed_source: string
+  unobserved_reason: string | null
   indexer_observed_total: string | null
   drift: string | null
   status: string
@@ -151,6 +152,7 @@ async function lastRun(): Promise<{
   const rows = await sql<
     {
       observed_source: string
+      unobserved_reason: string | null
       indexer_observed_total: string | null
       drift: string | null
       status: string
@@ -158,6 +160,7 @@ async function lastRun(): Promise<{
     }[]
   >`
     select observed_source,
+           unobserved_reason,
            indexer_observed_total::text as indexer_observed_total,
            drift::text as drift,
            status,
@@ -556,14 +559,23 @@ test('SHARD has no chain, so the job asks nobody and records liability_sum', { s
  * and never an observed zero.
  * ══════════════════════════════════════════════════════════════════════════════════════════════ */
 
-/** What every break must be true of, asserted in one place so no case can quietly assert less. */
-async function assertUnobservedFailure(): Promise<void> {
+/**
+ * What every break must be true of, asserted in one place so no case can quietly assert less.
+ *
+ * `expected` is the `unobserved_reason` migration 12 requires. It is a REQUIRED parameter rather
+ * than an optional one on purpose: every break below asserted the same four columns, which is
+ * exactly how a 401 from an expired credential and a 503 from an unfollowed chain came to be the
+ * same row for the life of the service. A helper that let a case skip the reason would let that
+ * back in one case at a time.
+ */
+async function assertUnobservedFailure(expected: string): Promise<void> {
   const row = await lastRun()
   assert.equal(row.observed_source, 'unavailable', 'an unobservable indexer produced an observation')
   assert.equal(row.status, 'failed')
   // NULL, not 0, in both columns migration 11 constrains. A zero here would be a measurement.
   assert.equal(row.indexer_observed_total, null)
   assert.equal(row.drift, null)
+  assert.equal(row.unobserved_reason, expected, 'the run did not record WHY it could not observe')
   assert.equal(await frozen(), true)
 }
 
@@ -578,7 +590,9 @@ test('BREAK 1 — an unreachable indexer freezes the asset; the job never sees a
     deadlineMs: 1_000,
   })
   await runReconcileJob(dead)
-  await assertUnobservedFailure()
+  // `unreachable`, not `indexer_error`: nothing on the far end answered at all. Migration 12 makes
+  // the run say which, so this freeze is not confused with the estate's honest `chain_not_followed`.
+  await assertUnobservedFailure('unreachable')
 })
 
 test('BREAK 2 — a stalled indexer ends at the DEADLINE and does not hold the job lease open', { skip }, async () => {
@@ -589,7 +603,7 @@ test('BREAK 2 — a stalled indexer ends at the DEADLINE and does not hold the j
     httpIndexerClient({ baseUrl: fixtureBase, token: () => TOKEN, deadlineMs: 250 }),
   )
   const elapsed = Date.now() - startedAt
-  await assertUnobservedFailure()
+  await assertUnobservedFailure('timeout')
   // The ceiling is real and it is absolute, not per-attempt. Without one, a provider holding the
   // socket open holds this asset's lease with it and the next sweep cannot be claimed.
   assert.ok(elapsed < 5_000, `the deadline did not bound the call (${elapsed}ms)`)
@@ -605,7 +619,11 @@ test('BREAK 3 — no credential is a 401, which is a freeze and never a number',
   await runReconcileJob(fixtureClient(null))
   assert.equal(upstream.requests, 1)
   assert.equal(upstream.authorizations[0], null)
-  await assertUnobservedFailure()
+  // `unauthorized` — the indexer refused what was presented, which is a GRANT problem. It is a
+  // different row from `no_credential`, which is what `upstreams.ts` records when this container
+  // holds no credential at all and the call is therefore never sent. Those have different remedies
+  // (`derive-grants.mjs` against `estate-bootstrap.sh`) and, until migration 12, one row.
+  await assertUnobservedFailure('unauthorized')
 })
 
 test('BREAK 4 — a 503 with a fault code is a refusal, not a fallback signal', { skip }, async () => {
@@ -615,7 +633,9 @@ test('BREAK 4 — a 503 with a fault code is a refusal, not a fallback signal', 
   upstream.status = 503
   upstream.body = { error: 'custody_total_unavailable', code: 'chain_not_followed' }
   await runReconcileJob(fixtureClient())
-  await assertUnobservedFailure()
+  // **THE EXPECTED FREEZE.** This is the one an operator must be able to leave alone, and every
+  // other break in this file must be distinguishable from it.
+  await assertUnobservedFailure('indexer_error')
 })
 
 test('BREAK 5 — a 200 whose body is not a total, in every shape that would nearly parse', { skip }, async () => {
@@ -651,6 +671,9 @@ test('BREAK 5 — a 200 whose body is not a total, in every shape that would nea
     )
     assert.equal(row.indexer_observed_total, null, `${JSON.stringify(body)} became a total`)
     assert.equal(row.status, 'failed')
+    // A 200 that is not a total is the INDEXER's problem — a version skew, or something that is not
+    // the indexer on the far end of that URL. It must not be reported as an authentication fault.
+    assert.equal(row.unobserved_reason, 'unusable_answer', `${JSON.stringify(body)} was misdiagnosed`)
   }
 })
 
@@ -704,7 +727,7 @@ test('BREAK 8 — a deployment with no INDEXER_URL freezes rather than falling b
   // `deps.indexer` is `undefined`, which is what `index.ts` builds when the variable is unset. The
   // optional chain in the handler must not become an absence that reads as "check not required".
   await runReconcileJob(undefined)
-  await assertUnobservedFailure()
+  await assertUnobservedFailure('not_configured')
   assert.equal(await runCount(), 1)
 })
 
@@ -737,8 +760,9 @@ test('LIVE — one unreadable address withholds the whole total, and the job rec
 
   // The tempting answer was 4 EMBER — the address that answered. It is low, low is positive drift,
   // and positive drift freezes on the strength of one RPC failure while asserting a number that
-  // was never true. The indexer refuses; the ledger records that nobody looked.
-  await assertUnobservedFailure()
+  // was never true. The indexer refuses; the ledger records that nobody looked, and that the
+  // refusal came from the INDEXER rather than from this service's credentials.
+  await assertUnobservedFailure('indexer_error')
 })
 
 test('LIVE — a token without indexer:read is a 401, and the whole loop fails closed on it', { skip: liveSkip }, async () => {
@@ -747,7 +771,7 @@ test('LIVE — a token without indexer:read is a 401, and the whole loop fails c
 
   await runReconcileJob(liveClient('not-the-service-token'))
 
-  await assertUnobservedFailure()
+  await assertUnobservedFailure('unauthorized')
 })
 
 test('LIVE — the confirmed depth is real: a balance is read below the head, not at it', { skip: liveSkip }, async () => {

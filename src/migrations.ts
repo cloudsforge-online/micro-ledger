@@ -771,6 +771,91 @@ export const MIGRATIONS: readonly Migration[] = [
         execute function reconciliation_runs_require_chain_observation();
     `,
   },
+
+  {
+    version: 12,
+    name: 'unobserved_reason',
+    up: `
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+      -- A FREEZE THAT COULD NOT BE READ.
+      --
+      -- Migration 11 above made "nobody observed this asset" a first-class, recordable fact, and it
+      -- was right to. What it did not record is WHY nobody observed it, and the estate found out
+      -- what that costs the first time a real EMBER testnet was driven:
+      --
+      --   LEDGER_SERVICE_TOKEN held a 600-second token read once at boot. The reconciliation job
+      --   runs every 900 seconds. From minute ten of every deployment the custody call 401'd, which
+      --   this service maps to no observation, which lands here as observed_source='unavailable',
+      --   indexer_observed_total NULL, drift NULL, status 'failed' — and freezes EMBER.
+      --
+      -- Every one of those columns was CORRECT. The run genuinely had no observation, and freezing
+      -- was genuinely the right response. But the row it wrote is BYTE-IDENTICAL to the row written
+      -- when Hearth is simply not followed, which is EMBER's honest, expected, argued-for state
+      -- until that chain launches (see the note on LEDGER_RECONCILE_ASSETS in env.ts). So the check
+      -- built to stop this ledger lying to itself was reporting a true fact for a false reason, in a
+      -- shape nobody could distinguish from the true one. An operator reading 'unavailable' went to
+      -- look at a chain that was fine.
+      --
+      -- The cause is fixed in code — ledger now holds a credential and mints its own tokens. This
+      -- column exists because that fix does not generalise: an expired token is one of eight ways
+      -- to fail to observe, and the next one will be silent again unless the row says which.
+      --
+      -- ── WHY THE SHAPE IS CONSTRAINED AND THE VOCABULARY IS NOT ───────────────────────────────
+      --
+      -- The CHECK below is a biconditional on PRESENCE — a run that observed nothing must say why,
+      -- and a run that observed something may not pretend it did not. That is the same class of
+      -- rule as migration 11's, and it is worth having for the same reason: a handler-only guard is
+      -- bypassed by a bug, a later migration, or an operator with a psql connection.
+      --
+      -- The set of VALUES is deliberately not enumerated here, and that is a decision rather than
+      -- an omission. Migration 11 argues at length that a list inlined into a CHECK is a second
+      -- declaration that drifts from the first in silence, and that the migration text is
+      -- CHECKSUMMED so regenerating it is not available either. The reasons live in one place —
+      -- UnobservedReason in src/indexerclient.ts, a string union the compiler enforces at every
+      -- site that produces one — and servicetoken.test.ts asserts this column only ever holds a
+      -- member of it. Enumerating them here would also mean that adding a ninth failure mode
+      -- makes the INSERT throw inside the reconciliation transaction until a migration ships,
+      -- which would turn a new diagnosis into a dead-lettered job on the estate's solvency check.
+      --
+      -- The shape is still constrained: lower snake_case, 3..32 characters. That is enough to stop
+      -- free text, an operator's note, or a raw error message — which could carry a URL, a token or
+      -- a stack — being laundered into a column that is read by dashboards and logged in full.
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+
+      alter table reconciliation_runs add column if not exists unobserved_reason text;
+
+      -- Rows written before this column existed. They are real unobserved runs and their reason is
+      -- genuinely unknown, so it is recorded AS unknown rather than guessed at — the same principle
+      -- as NULL-not-zero one column over. A live estate has these: the defect above produced them
+      -- every fifteen minutes. Naming them 'unrecorded' rather than back-filling 'no_credential'
+      -- keeps the constraint honest: this migration knows the rows had no reason stored, and it
+      -- does not know what the reason was.
+      update reconciliation_runs
+         set unobserved_reason = 'unrecorded'
+       where observed_source = 'unavailable'
+         and unobserved_reason is null;
+
+      alter table reconciliation_runs
+        drop constraint if exists reconciliation_runs_reason_chk;
+      alter table reconciliation_runs
+        add constraint reconciliation_runs_reason_chk check (
+          (observed_source = 'unavailable') = (unobserved_reason is not null)
+        );
+
+      alter table reconciliation_runs
+        drop constraint if exists reconciliation_runs_reason_shape_chk;
+      alter table reconciliation_runs
+        add constraint reconciliation_runs_reason_shape_chk check (
+          unobserved_reason is null or unobserved_reason ~ '^[a-z][a-z0-9_]{2,31}$'
+        );
+
+      -- The access path for "why has this asset been unobservable all week", which is the question
+      -- asked once the freeze has been noticed and is the reason the column exists.
+      create index if not exists reconciliation_runs_unobserved_idx
+        on reconciliation_runs (asset_code, unobserved_reason, started_at desc)
+        where unobserved_reason is not null;
+    `,
+  },
 ]
 
 /**

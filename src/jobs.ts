@@ -38,7 +38,7 @@ import { type AssetTolerance, type LedgerAssetCode, isChainAsset } from '@clouds
 import { chainSpec } from '@cloudsforge/contracts-chain'
 import { rebuildBalances } from './balances.ts'
 import { reconcileAsset } from './reconcile.ts'
-import { indexerChainFor, type IndexerClient } from './indexerclient.ts'
+import { indexerChainFor, type IndexerClient, type UnobservedReason } from './indexerclient.ts'
 import { reapIdempotencyKeys } from './idempotency.ts'
 import { createRelay, type RelayDeps, type Db } from './outbox.ts'
 
@@ -176,6 +176,38 @@ export function chainNameFor(assetCode: LedgerAssetCode): string {
   return chainSpec(assetCode).name
 }
 
+/**
+ * What to do about each way of failing to observe, put beside the log line that reports it.
+ *
+ * A `Record<UnobservedReason, string>` rather than a partial map or a `switch`: adding a ninth
+ * reason to the union in `indexerclient.ts` without deciding what an operator should do about it is
+ * then a compile error, which is the only mechanism that keeps a diagnosis from decaying back into
+ * an undifferentiated string. It exists because the freeze it annotates is the estate's most
+ * consequential one and, until this change, the least readable — the same three words whether the
+ * chain had not launched or this service's own credential had expired.
+ *
+ * Deliberately generic advice, containing no URL and no value read from the environment: this is
+ * interpolated into a log line that ships to the collector.
+ */
+const REMEDIES: Record<UnobservedReason, string> = {
+  not_configured:
+    'this deployment has no INDEXER_URL, so nothing was dialled — set it, or remove the asset from LEDGER_RECONCILE_ASSETS deliberately',
+  no_credential:
+    'THIS IS NOT THE CHAIN. ledger could not obtain a service token: LEDGER_IDENTITY_CREDENTIAL is unset, or identity refused the exchange, or identity is unreachable',
+  unauthorized:
+    'THIS IS NOT THE CHAIN. the indexer refused ledger token; check the indexer:read grant derived from INDEXER_SCOPES in src/indexerclient.ts',
+  timeout:
+    'the indexer did not answer within LEDGER_INDEXER_DEADLINE_MS; the chain reading itself may be slow rather than absent',
+  unreachable:
+    'no HTTP answer from the indexer at all — check it is up and that INDEXER_URL resolves from this container',
+  indexer_error:
+    'the indexer answered 5xx; its fault code is the diagnosis. `chain_not_followed` here is the EXPECTED state until Hearth launches',
+  indexer_refused:
+    'the indexer refused the request itself — an unknown chain slug or a network it does not carry',
+  unusable_answer:
+    'the indexer answered 200 with something that is not a decimal-string total; a version skew, or that URL is not the indexer',
+}
+
 export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
   const relayDeps: RelayDeps = {
     sql: deps.sql,
@@ -249,8 +281,34 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
     // this handler skips but `reconcileAsset` demands a reading for would freeze for ever with no
     // call ever having been attempted.
     const chainSlug = indexerChainFor(asset)
-    const observed =
-      chainSlug === undefined ? undefined : await deps.indexer?.observedTotalFor(chainSlug, network)
+    /**
+     * The observation, and — when there is none — why not.
+     *
+     * `observe` rather than `observedTotalFor`, and the difference is the second half of this
+     * defect. The total alone made every failure identical: an expired token, an unlaunched chain,
+     * a timeout and a 403 all arrived here as `undefined` and left as the same row. That mattered
+     * because ledger's own credential was a 600-second token and this job runs every 900 seconds,
+     * so the estate spent every deployment past minute ten writing "the chain could not be
+     * observed" when the chain was fine and the token was dead. `indexerclient.ts` classifies;
+     * nothing is inferred here.
+     *
+     * The two ways of not asking are separated rather than collapsed, and the separation is the
+     * same discipline this whole change is about:
+     *
+     *   * **`chainSlug === undefined`** is SHARD or USD — assets with no chain. Nothing is asked
+     *     because there is nothing to ask, `reconcileAsset` records `liability_sum`, and there is
+     *     no absence to explain. Reporting `not_configured` here would be a lie that happens not to
+     *     be read today, and the day it IS read is the day an on-chain asset is added without a
+     *     slug and gets diagnosed as a deploy fault.
+     *   * **`deps.indexer === undefined`** is a deployment with no `INDEXER_URL`. Nothing was
+     *     dialled, and that IS a fact about this deploy manifest — `not_configured`.
+     */
+    const observation =
+      chainSlug === undefined
+        ? { total: undefined, reason: null }
+        : deps.indexer === undefined
+          ? { total: undefined, reason: 'not_configured' as const }
+          : await deps.indexer.observe(chainSlug, network)
 
     const result = await reconcileAsset(deps.sql, {
       assetCode: asset,
@@ -258,7 +316,13 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
       network,
       tolerance: deps.assetTolerance,
       producer: deps.producer,
-      ...(observed === undefined ? {} : { indexerObservedTotal: observed }),
+      // The conditional spread, not `indexerObservedTotal: observation.total`.
+      // `exactOptionalPropertyTypes` aside, an explicitly-present `undefined` and an absent key are
+      // the same to `reconcileAsset`; writing it this way makes the absence a decision at the call
+      // site rather than a value that happened to be undefined.
+      ...(observation.total === undefined
+        ? { ...(observation.reason ? { unobservedReason: observation.reason } : {}) }
+        : { indexerObservedTotal: observation.total }),
     })
 
     // **`Number(null)` is `0`.** This line read `Number(result.drift)` unconditionally, and now that
@@ -271,6 +335,18 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
     if (result.drift !== null) {
       deps.metrics.set('ledger_reconciliation_drift', Number(result.drift), { asset: assetCode })
     }
+    // **Labelled by reason, so an alert can tell the two freezes apart without a human reading a
+    // log.** `ledger_reconciliation_observed` going to 0 was the only signal, and it fired
+    // identically for "Hearth has not launched" — which is expected and is argued for in `env.ts` —
+    // and for "this service's token expired ten minutes into a fifteen-minute job", which is a
+    // page. One series with a reason label is what lets the second one be alerted on and the first
+    // one not be. Written only when there IS a reason: a gauge cannot express "not applicable".
+    if (result.unobservedReason !== null) {
+      deps.metrics.increment('ledger_reconciliation_unobserved_total', {
+        asset: assetCode,
+        reason: result.unobservedReason,
+      })
+    }
 
     const log = deps.logger.child({ job: RECONCILE_KIND, asset: assetCode })
     if (result.observedSource === 'unavailable') {
@@ -280,7 +356,16 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
       // every unobserved asset hunting a discrepancy that was never measured — and this is the
       // state EMBER is in until Hearth's mainnet and its indexer feed exist, so it is the line that
       // will actually be read.
-      log.fatal('RECONCILIATION HAD NO CHAIN OBSERVATION — withdrawals frozen', { ...result })
+      //
+      // AND THE REASON IS IN THE MESSAGE ITSELF, not only in the fields. This line was fatal, and
+      // correct, and useless: it said the same thing when the chain was unfollowed and when this
+      // service could not authenticate, which for months was the state the estate was actually in.
+      // A `log.fatal` that cannot distinguish the expected case from the page is a fatal nobody
+      // reads.
+      log.fatal(`RECONCILIATION HAD NO CHAIN OBSERVATION (${String(result.unobservedReason)}) — withdrawals frozen`, {
+        ...result,
+        remedy: REMEDIES[result.unobservedReason ?? 'unreachable'],
+      })
     } else if (result.froze) {
       // Pages. Drift beyond tolerance means the ledger can no longer prove it holds what it owes,
       // and every withdrawal it settles until this is explained may be paying out value that is

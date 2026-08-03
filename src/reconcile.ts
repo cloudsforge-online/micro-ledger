@@ -62,6 +62,10 @@ import {
 } from '@cloudsforge/contracts-money'
 import { ON_CHAIN_ASSETS } from '@cloudsforge/contracts-chain'
 import { withOutbox, type Db, type Tx } from './outbox.ts'
+// Type-only. The taxonomy is declared where it is DECIDED — beside the `catch` that classifies a
+// transport failure — rather than here, where it is only written down. Importing it the other way
+// round would put a vocabulary about HTTP into the module that does arithmetic on money.
+import type { UnobservedReason } from './indexerclient.ts'
 
 /**
  * Is this asset settled on a chain, and therefore only ever attestable BY a chain?
@@ -148,6 +152,29 @@ export interface ReconcileInput {
    * a chain is not a weaker check, it is a different question wearing the answer's clothes.
    */
   readonly indexerObservedTotal?: bigint
+  /**
+   * Why there is no observation, when there is none.
+   *
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   * **REQUIRED IN PRACTICE, AND OPTIONAL ONLY IN TYPE.** Migration 12's
+   * `reconciliation_runs_reason_chk` refuses an `unavailable` run that does not carry one, so a
+   * caller that omits it for a chain-backed asset gets a 23514 and no row — deliberately, because
+   * the alternative is the state this field was added to end.
+   *
+   * A chain asset frozen because **Hearth is not followed** and a chain asset frozen because **this
+   * service's ten-minute token expired fifteen minutes into a fifteen-minute job** wrote the same
+   * row: `unavailable`, NULL total, NULL drift, `failed`. Both are correct records of "nobody
+   * observed it". Only one of them is a fact about the chain, and the other is a fact about this
+   * deployment's credentials — and for the life of the service they were the same line.
+   *
+   * `observed_source` says which side the comparison came from. It has no way to say why a side is
+   * missing, and "missing" is the state that freezes the asset.
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   *
+   * Ignored when `indexerObservedTotal` is present: an observed run has no absence to explain, and
+   * the schema refuses one that claims otherwise.
+   */
+  readonly unobservedReason?: UnobservedReason
 }
 
 /**
@@ -174,6 +201,11 @@ export interface ReconciliationResult {
   readonly drift: string | null
   readonly status: ReconciliationStatus
   readonly observedSource: ObservedSource
+  /**
+   * Why nothing was observed. Non-null exactly when `observedSource` is `'unavailable'`, which the
+   * schema enforces rather than this type.
+   */
+  readonly unobservedReason: UnobservedReason | null
   readonly froze: boolean
   readonly unfroze: boolean
 }
@@ -240,12 +272,20 @@ export async function reconcileAsset(sql: Db, input: ReconcileInput): Promise<Re
      */
     let observedSource: ObservedSource
     let observedTotal: bigint | null
+    let unobservedReason: UnobservedReason | null = null
     if (input.indexerObservedTotal !== undefined) {
       observedSource = 'indexer'
       observedTotal = input.indexerObservedTotal
     } else if (isOnChainAsset(input.assetCode)) {
       observedSource = 'unavailable'
       observedTotal = null
+      // **The fallback is `'unreachable'`, not `'unknown'`, and it is a last resort rather than a
+      // default.** Every production path supplies a reason — `jobs.ts` takes it from the client's
+      // own classification — and migration 12 refuses a row without one, so this branch is reached
+      // only by a caller that forgot. It resolves to the most conservative honest reading of "a
+      // caller had no total and said nothing about why": nobody reached the indexer. It must never
+      // be a value that reads as diagnosed, because a wrong diagnosis is worse than a coarse one.
+      unobservedReason = input.unobservedReason ?? 'unreachable'
     } else {
       observedSource = 'liability_sum'
       observedTotal = await totalFor(tx, 'liability', input.assetCode)
@@ -263,13 +303,13 @@ export async function reconcileAsset(sql: Db, input: ReconcileInput): Promise<Re
     const runRows = await tx<{ id: string }[]>`
       insert into reconciliation_runs (
         chain, network, asset_code, finished_at, ledger_custody_total,
-        indexer_observed_total, drift, status, observed_source
+        indexer_observed_total, drift, status, observed_source, unobserved_reason
       ) values (
         ${input.chain}, ${input.network}, ${input.assetCode}, now(),
         ${custodyTotal.toString()}::numeric(78,0),
         ${observedTotal === null ? null : observedTotal.toString()}::numeric(78,0),
         ${drift === null ? null : drift.toString()}::numeric(78,0),
-        ${status}, ${observedSource}
+        ${status}, ${observedSource}, ${unobservedReason}
       )
       returning id
     `
@@ -288,10 +328,18 @@ export async function reconcileAsset(sql: Db, input: ReconcileInput): Promise<Re
       // `drift`. The two are null together by construction and the schema enforces it, but narrowing
       // on one to dereference the other needs a `!` that would survive a future edit breaking the
       // pairing. Narrowing on the thing being read needs no assertion at all.
+      //
+      // The unobserved message now NAMES THE CAUSE, and that is the difference between a freeze an
+      // operator can act on and one they can only stare at. `asset_freezes.reason` is what the
+      // console and `GET /reconciliation` show first; until this change it said "no indexer
+      // observation" whether the chain was unlaunched or this service's own token had expired
+      // fifteen minutes into a fifteen-minute job. Those need opposite responses — wait, versus
+      // look at identity — and they were one sentence.
       const reason =
         observedTotal === null
           ? `reconciliation failed: no indexer observation for on-chain asset ${input.assetCode}` +
-            ` (custody ${custodyTotal.toString()}; chain holdings UNKNOWN, not zero)`
+            ` (custody ${custodyTotal.toString()}; chain holdings UNKNOWN, not zero;` +
+            ` reason ${String(unobservedReason)})`
           : `reconciliation ${status}: drift ${String(drift)} (custody ${custodyTotal.toString()}, observed ${observedTotal.toString()})`
 
       // `on conflict do update` rather than `do nothing`: a still-drifting asset must carry the
@@ -323,6 +371,7 @@ export async function reconcileAsset(sql: Db, input: ReconcileInput): Promise<Re
       drift: drift === null ? null : drift.toString(),
       status,
       observedSource,
+      unobservedReason,
       froze,
       unfroze,
     }
@@ -357,6 +406,14 @@ export async function reconcileAsset(sql: Db, input: ReconcileInput): Promise<Re
         ledgerCustodyTotal: result.ledgerCustodyTotal,
         indexerObservedTotal: result.indexerObservedTotal,
         observedSource: result.observedSource,
+        // **On the wire, and `null` rather than absent.** A subscriber must be able to tell an
+        // unfollowed chain from an authentication failure without reading this service's logs, and
+        // `activity`'s and `analytics`' readers of this topic both take the payload as it arrives.
+        // JSON drops `undefined`, and an absent key here would be read as "observed" by anything
+        // that checks presence — the same laundering `drift: null` exists to prevent, one field
+        // over. Every value is a member of `UnobservedReason`; no error message and no URL reaches
+        // this payload, so nothing here can carry a token into a subscriber's log.
+        unobservedReason: result.unobservedReason,
         // The two facts an operator acts on, stated rather than inferred from `status`. A reader
         // that derived "withdrawals just stopped" from the status string would have to know the
         // freeze rule — which lives in `@cloudsforge/contracts-money` and is deliberately asymmetric
@@ -410,6 +467,14 @@ export interface ReconciliationRunView {
   readonly drift: string | null
   readonly status: ReconciliationStatus
   readonly observedSource: string
+  /**
+   * Why nothing was observed, for the run that has no observation. `null` otherwise.
+   *
+   * This is the field an operator reads FIRST on a frozen chain asset, because it is the one that
+   * decides whether the answer is "the chain has not launched, this is expected" or "this
+   * deployment cannot authenticate and the chain is fine". `GET /reconciliation` serves it.
+   */
+  readonly unobservedReason: string | null
 }
 
 /** The most recent run per asset, which is what a dashboard and an operator both want first. */
@@ -427,13 +492,14 @@ export async function latestRuns(sql: Db): Promise<ReconciliationRunView[]> {
       drift: string | null
       status: string
       observed_source: string
+      unobserved_reason: string | null
     }[]
   >`
     select distinct on (asset_code)
            id, asset_code, chain, network, started_at, finished_at,
            ledger_custody_total::text as ledger_custody_total,
            indexer_observed_total::text as indexer_observed_total,
-           drift::text as drift, status, observed_source
+           drift::text as drift, status, observed_source, unobserved_reason
       from reconciliation_runs
      order by asset_code, started_at desc
   `
@@ -449,5 +515,6 @@ export async function latestRuns(sql: Db): Promise<ReconciliationRunView[]> {
     drift: row.drift,
     status: row.status as ReconciliationStatus,
     observedSource: row.observed_source,
+    unobservedReason: row.unobserved_reason,
   }))
 }
