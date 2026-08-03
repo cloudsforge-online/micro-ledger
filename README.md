@@ -292,6 +292,62 @@ skipped** (`.github/workflows/ci.yml`), which is what stops a green run that pro
 
 ---
 
+## CI is red here, on purpose, and this is the reason
+
+**No test in this repository fails.** The last run was **195 tests, 191 passing, 0 failing, 4
+skipped**, every database-backed case among them executed against a real Postgres. The build still
+goes red, and it is worth knowing exactly why before anyone tries to "fix" it.
+
+The step that fails is this one, in the reusable workflow every repository shares
+(`micro-org/.github/workflows/service-ci.yml:776`):
+
+```sh
+if grep -qiE 'set [A-Z_]*TEST_DATABASE_URL|database tests are disabled' /tmp/test-output.txt; then
+  echo "::error::the database-backed tests SKIPPED — CI would have gone green without running them"
+```
+
+**That rule is correct and must not be weakened.** It exists because a suite whose database tests
+silently skip is the worst possible green: it reports success having tested nothing, which is the
+estate's recurring defect — a check that cannot fail — in its purest form. The rule's own error
+text names the intent: *"check that this service reads `<SERVICE>_TEST_DATABASE_URL`"*.
+
+**What trips it here is a wildcard.** `[A-Z_]*` matches **any** service's DSN name, not this
+service's. Four cases in `src/chainbacking.test.ts` are gated on `liveSkip`, whose message is:
+
+> `set INDEXER_TEST_DATABASE_URL (name must contain "test") with a micro-indexer checkout beside
+> this one`
+
+`INDEXER_` satisfies `[A-Z_]*` exactly as well as `LEDGER_` does, so the grep cannot tell "this
+service's database was missing and nothing ran" from "this service's database was present, and four
+cross-service cases needing a **second** database stood down." The first is the disaster the rule
+was written for. The second is what happens here, every run.
+
+**What the four are, and why they need a second database.** They are the `LIVE` tier: `micro-indexer`'s
+real `createServer`, `rpcCustodyObserver` and `RpcPool`, against a deterministic JSON-RPC node on a
+real port, imported across the checkout. With them, the chain of custody from `eth_getBalance` to a
+row in `reconciliation_runs` contains **no test double at all**. They are the most valuable tests in
+this repository and they are the ones CI cannot run, because CI checks out one repository and they
+need two.
+
+**Either fix would be legitimate; neither is ours to make unilaterally.** Scope the grep to the
+service's own variable — `set ${SERVICE^^}_TEST_DATABASE_URL` rather than `[A-Z_]*` — so it keeps
+catching the disaster and stops catching this. Or give the estate job an indexer checkout and a
+second Postgres, and run the `LIVE` tier where it belongs. The first is a two-character change to a
+workflow shared by sixty repositories and needs to be made by someone holding `micro-org`; the
+second costs CI minutes but buys the only end-to-end proof of the guarantee this repository exists
+for.
+
+**Until then the guarantee is validated by running it, not by a badge.** The loop has been driven
+against a real EMBER testnet — chain id 7412, a miner producing blocks — reaching
+`observed_source = 'indexer'` with drift of **exactly 0 over 31000000000000000000 wei**, then
+correctly refusing and re-freezing when the custody set was emptied, then going clean again on
+restore. Both directions, not just the happy one. And since the credential fix it has been proven
+past its own expiry: a second reconciliation **661 seconds** after boot, where the first token had
+already been refused with a real 401 by the real indexer.
+
+A red badge on a repository whose tests all pass is worth exactly one paragraph of explanation.
+This is that paragraph, and it should be deleted the day either fix above lands.
+
 ## Known gaps
 
 * **The loop is closed. What remains is a deploy step and a chain that has not launched.** This
