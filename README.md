@@ -100,9 +100,18 @@ only reads (`src/server.ts:73-80`).
 ### Status codes
 
 Grouped by what the caller should do (`src/server.ts:234-248`): **400** the request could not be a
-legal entry, **404** something named does not exist, **409** the state refuses it (`insufficient_funds`,
+legal entry (`invalid_entry`, `unbalanced_entry`, `unknown_account`, `retired_asset`), **404**
+something named does not exist, **409** the state refuses it (`insufficient_funds`,
 `asset_frozen`, `idempotency_key_reuse`, `idempotency_in_flight`, `already_released`,
-`account_conflict`), **500** an invariant fired that should have been unreachable. A bad token is
+`account_conflict`), **500** an invariant fired that should have been unreachable.
+
+`retired_asset` is its own code rather than an `invalid_entry` because the two ask for different
+things from the caller: an invalid entry should be retried once it is well formed, and a retired
+asset never will be. It means the entry would have ACQUIRED a wound-down unit — `purchase`,
+`subscription_charge` or `deposit_credited` denominated in a member of `retired_assets` (migration
+13). **Existing holdings are unaffected**: a holder may still withdraw, transfer, convert, adjust
+and reverse in a retired asset, and each of those routes is driven by a test against real money in
+one. Retiring an asset must never strand it. A bad token is
 401; **a verifier that could not reach the JWKS is 503**, because answering 401 there would sign
 every service in the estate out because identity is having a bad minute (`src/server.ts:268`).
 
