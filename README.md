@@ -428,3 +428,10 @@ where the first token had already been refused with a real 401 by the real index
 * **`BASELINE_VERSION = 0`** (`src/migrations.ts:631`): there is nothing to adopt. Moving value out
   of `forge-pay`'s single-sided `ledger` is a data migration with its own opening-balance entries,
   not a schema baseline, and it has not been written.
+
+---
+
+## Provenance
+
+The code in this repository was written by **Claude Opus 5** and **Claude Fable 5**, assets
+generated with **FLUX 2 Pro**, under human direction and review.
