@@ -402,9 +402,12 @@ function buildRoutes(): Route[] {
     }),
 
     define('POST', '/entries', async (ctx, deps) => {
-      await authorise(ctx, deps, POST_SCOPE)
+      const principal = await authorise(ctx, deps, POST_SCOPE)
       const body = await readJson(ctx.req)
-      const request = parsePostEntry(body, ctx.requestId)
+      // The spread order is load-bearing: `attribute` wins over whatever the body said, and it has
+      // already thrown 403 if the two disagree. Parsing first keeps the shape errors (400) ahead of
+      // the attribution error (403), so a malformed body is never reported as an authority problem.
+      const request = { ...parsePostEntry(body, ctx.requestId), ...attribute(principal, body) }
 
       const done = deps.lifecycle.track()
       try {
@@ -450,9 +453,9 @@ function buildRoutes(): Route[] {
     }),
 
     define('POST', '/entries/:id/reverse', async (ctx, deps) => {
-      await authorise(ctx, deps, POST_SCOPE)
+      const principal = await authorise(ctx, deps, POST_SCOPE)
       const body = await readJson(ctx.req)
-      const originatingService = requireString(body, 'originatingService')
+      const { originatingService, actor } = attribute(principal, body)
 
       const done = deps.lifecycle.track()
       try {
@@ -461,7 +464,7 @@ function buildRoutes(): Route[] {
           ctx.params['id'] ?? '',
           {
             originatingService,
-            actor: requireString(body, 'actor') as `service:${string}`,
+            actor,
             correlationId: optionalString(body, 'correlationId') ?? ctx.requestId,
             idempotencyKey: requireString(body, 'idempotencyKey'),
             ...(optionalString(body, 'description') !== undefined
@@ -487,7 +490,7 @@ function buildRoutes(): Route[] {
     }),
 
     define('POST', '/reservations', async (ctx, deps) => {
-      await authorise(ctx, deps, RESERVE_SCOPE)
+      const principal = await authorise(ctx, deps, RESERVE_SCOPE)
       const body = await readJson(ctx.req)
 
       const done = deps.lifecycle.track()
@@ -498,8 +501,7 @@ function buildRoutes(): Route[] {
             subject: requireString(body, 'subject'),
             assetCode: requireString(body, 'assetCode') as LedgerAssetCode,
             amount: requireAmount(body, 'amount'),
-            originatingService: requireString(body, 'originatingService'),
-            actor: requireString(body, 'actor') as `service:${string}`,
+            ...attribute(principal, body),
             correlationId: optionalString(body, 'correlationId') ?? ctx.requestId,
             idempotencyKey: requireString(body, 'idempotencyKey'),
             ...(optionalString(body, 'description') !== undefined
@@ -526,7 +528,7 @@ function buildRoutes(): Route[] {
     }),
 
     define('POST', '/reservations/:id/release', async (ctx, deps) => {
-      await authorise(ctx, deps, RESERVE_SCOPE)
+      const principal = await authorise(ctx, deps, RESERVE_SCOPE)
       const body = await readJson(ctx.req)
 
       const done = deps.lifecycle.track()
@@ -535,8 +537,7 @@ function buildRoutes(): Route[] {
           ledgerDeps(deps),
           ctx.params['id'] ?? '',
           {
-            originatingService: requireString(body, 'originatingService'),
-            actor: requireString(body, 'actor') as `service:${string}`,
+            ...attribute(principal, body),
             correlationId: optionalString(body, 'correlationId') ?? ctx.requestId,
             idempotencyKey: requireString(body, 'idempotencyKey'),
             ...(optionalString(body, 'description') !== undefined
@@ -633,6 +634,71 @@ async function authorise(ctx: RequestContext, deps: ServerDeps, scope: string): 
   if (principal.kind !== 'service') throw new ForbiddenError(`${scope} (service token required)`)
   requireScope(principal, scope)
   return principal
+}
+
+/**
+ * Bind an entry's attribution to the caller that is actually making the request.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **`originating_service` WAS A STRING IN THE REQUEST BODY, AND NOTHING EVER COMPARED IT WITH THE
+ * TOKEN.** Every write route read it with `requireString(body, 'originatingService')` and wrote it
+ * straight into the journal, so any holder of any `ledger:post` token could sign another service's
+ * name to a movement of money. `actor` was the same field twice over.
+ *
+ * That is not a hypothetical. On 2026-08-04 a `deposit_credited` for 5000000000000000000 wei of
+ * EMBER was posted against no on-chain deposit; the row read `originating_service = 'wallet'`,
+ * `actor = 'service:wallet'`, and it was not wallet. `micro-wallet` posts to this service from
+ * exactly five call sites (`money.ts:473`, `deposits.ts:601`, `withdrawals.ts:380/535/627`), every
+ * one of them a real money operation, and it has no probe path at all. The incident response
+ * nonetheless began by looking for one, because the journal said wallet and the journal was the
+ * evidence. **A caller-supplied attribution is not evidence, and this service publishes it as
+ * though it were** — `ledger_postings_total{service,kind}` is labelled from it and its own comment
+ * calls it the thing that finally makes "how much did ForgeMint earn" answerable, and
+ * `GET /entries?originatingService=` is an audit query over it.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * ## Why this refuses rather than silently stamping the right name
+ *
+ * Deriving `originatingService` from the principal and ignoring the body would also make the column
+ * true, and it was the first thing tried. It is worse: a caller that believes it is posting as
+ * another service would have its entry quietly relabelled and would never find out, which is the
+ * class of "fixed by making the check unable to fail" this repository keeps deleting. The field
+ * stays REQUIRED — the caller states who it thinks it is — and a disagreement is a 403.
+ *
+ * ## Why `actor` is bound only when it names a service
+ *
+ * `actor` is a wider vocabulary than `originatingService`: `system` is the honest actor for a
+ * scheduled sweep and `user:<id>` for an operator acting through a service. Only the
+ * `service:<name>` form is a claim about *which service*, so only that form is checked. Binding
+ * `system` to `service:<caller>` would force a lie into every job-driven entry in the estate.
+ *
+ * ## What this does NOT do, stated so nobody mistakes it for a solvency control
+ *
+ * It does not make an unbacked credit impossible. A caller holding wallet's own credential can
+ * still post one, and the only thing in the estate that catches that is reconciliation against the
+ * chain — which is why nothing here is allowed to exempt anything from that check. This makes the
+ * journal's answer to *who did it* trustworthy. Reconciliation remains the answer to *is it real*.
+ */
+function attribute(
+  principal: Principal,
+  body: Record<string, unknown>,
+): { originatingService: string; actor: `service:${string}` } {
+  const originatingService = requireString(body, 'originatingService')
+  const actor = requireString(body, 'actor')
+  // Narrowed by `authorise`, which refuses every non-service principal before this is reached.
+  const caller = principal.kind === 'service' ? principal.service : ''
+
+  if (originatingService !== caller) {
+    throw new ForbiddenError(
+      `attribution to '${originatingService}' (this token was minted for '${caller}')`,
+    )
+  }
+  if (actor.startsWith('service:') && actor !== `service:${caller}`) {
+    throw new ForbiddenError(
+      `actor '${actor}' (this token was minted for '${caller}')`,
+    )
+  }
+  return { originatingService, actor: actor as `service:${string}` }
 }
 
 /* ------------------------------------------------------------------------ body parsing */

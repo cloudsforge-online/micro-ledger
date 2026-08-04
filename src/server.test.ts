@@ -34,6 +34,13 @@ const verifier: PrincipalVerifier = {
         return { kind: 'service', service: 'reporting', scopes: ['ledger:read'] }
       case 'svc-post':
         return { kind: 'service', service: 'wallet', scopes: ['ledger:post'] }
+      // `market` is the service that actually reserves, and it needs its own principal now that
+      // `attribute` refuses an entry signed with somebody else's name. Before that, the
+      // reservation tests below posted `originatingService: 'market'` on `svc-all` — a WALLET
+      // token — and were accepted, which is the defect in miniature: this suite's own fixtures
+      // had a wallet credential writing market's name into the journal and nothing objected.
+      case 'svc-market':
+        return { kind: 'service', service: 'market', scopes: ['ledger:*'] }
       case 'svc-none':
         return { kind: 'service', service: 'nosy', scopes: ['other:read'] }
       case 'user':
@@ -313,7 +320,7 @@ test('a reservation round-trips through HTTP', { skip }, async () => {
   await call('POST', '/entries', { token: 'svc-all', body: depositBody('1000') })
 
   const reserved = await call('POST', '/reservations', {
-    token: 'svc-all',
+    token: 'svc-market',
     body: { subject: ALICE, assetCode: 'SHARD', amount: '400', originatingService: 'market', actor: 'service:market', idempotencyKey: freshKey() },
   })
   assert.equal(reserved.status, 201)
@@ -328,14 +335,14 @@ test('a reservation round-trips through HTTP', { skip }, async () => {
   assert.equal(byPurpose['reserved'], '400')
 
   const released = await call('POST', `/reservations/${reservationId}/release`, {
-    token: 'svc-all',
+    token: 'svc-market',
     body: { originatingService: 'market', actor: 'service:market', idempotencyKey: freshKey() },
   })
   assert.equal(released.status, 201)
 
   // A second, different release request is 409.
   const again = await call('POST', `/reservations/${reservationId}/release`, {
-    token: 'svc-all',
+    token: 'svc-market',
     body: { originatingService: 'market', actor: 'service:market', idempotencyKey: freshKey() },
   })
   assert.equal(again.status, 409)
@@ -348,7 +355,7 @@ test('a reversal round-trips through HTTP', { skip }, async () => {
 
   const reversed = await call('POST', `/entries/${entryId}/reverse`, {
     token: 'svc-all',
-    body: { originatingService: 'ops', actor: 'operator:1', idempotencyKey: freshKey() },
+    body: { originatingService: 'wallet', actor: 'operator:1', idempotencyKey: freshKey() },
   })
   assert.equal(reversed.status, 201)
   assert.equal(reversed.body['entry']!['reversesEntryId'], entryId)
@@ -361,7 +368,7 @@ test('a reversal round-trips through HTTP', { skip }, async () => {
 test('reversing something that does not exist is 404', { skip }, async () => {
   const response = await call('POST', '/entries/019a0000-0000-7000-8000-0000000000ff/reverse', {
     token: 'svc-all',
-    body: { originatingService: 'ops', actor: 'operator:1', idempotencyKey: freshKey() },
+    body: { originatingService: 'wallet', actor: 'operator:1', idempotencyKey: freshKey() },
   })
   assert.equal(response.status, 404)
 })
@@ -370,7 +377,7 @@ test('the metric label uses the route PATTERN, so a path parameter cannot mint t
   for (let i = 0; i < 3; i++) {
     await call('POST', `/entries/019a0000-0000-7000-8000-00000000000${i}/reverse`, {
       token: 'svc-all',
-      body: { originatingService: 'ops', actor: 'operator:1', idempotencyKey: freshKey() },
+      body: { originatingService: 'wallet', actor: 'operator:1', idempotencyKey: freshKey() },
     })
   }
   const metrics = await call('GET', '/metrics')
@@ -378,4 +385,125 @@ test('the metric label uses the route PATTERN, so a path parameter cannot mint t
   // caller take the scrape target down.
   assert.match(metrics.text, /route="\/entries\/:id\/reverse"/)
   assert.doesNotMatch(metrics.text, /route="\/entries\/019a0000/)
+})
+
+/* ================================================== attribution, bound to the caller */
+
+/**
+ * **The journal's `originating_service` used to be a string the caller chose.**
+ *
+ * Every write route read it out of the body and wrote it into the journal without ever comparing
+ * it with the token's subject, so any holder of any `ledger:post` token could sign another
+ * service's name to a movement of money. It is not a theoretical hole: on 2026-08-04 a
+ * `deposit_credited` for 5000000000000000000 wei of EMBER was posted against no on-chain deposit,
+ * the row read `originating_service = 'wallet'` and `actor = 'service:wallet'`, and it was not
+ * `micro-wallet` — which has no probe path at all and posts from five call sites, every one of
+ * them a real money operation. The incident response went looking for a defect in an innocent
+ * service because the journal said so and the journal was the evidence.
+ *
+ * That matters beyond one night. `ledger_postings_total{service,kind}` is labelled from this
+ * column and `GET /entries?originatingService=` is an audit query over it, so an unbound value
+ * makes both of them assertions by whoever is being audited.
+ *
+ * These cases drive both directions, because a check that only ever sees the matching case passes
+ * just as happily when it has been deleted.
+ */
+test('a service cannot sign another service\'s name to a movement of money', { skip }, async () => {
+  // `svc-market` is a real, scoped, valid credential. It simply is not wallet.
+  const impostor = await call('POST', '/entries', {
+    token: 'svc-market',
+    body: depositBody('1000'),
+  })
+  assert.equal(impostor.status, 403, 'a market token posted an entry attributed to wallet')
+  assert.match(impostor.body['error']!['message'], /wallet/)
+  assert.match(impostor.body['error']!['message'], /market/)
+
+  // AND NOTHING WAS WRITTEN. A 403 that still posted would be the worst of both: the caller is
+  // told no and the money moves anyway.
+  const entries = await call('GET', '/entries', { token: 'svc-read' })
+  assert.equal(
+    (entries.body['entries'] as unknown as unknown[]).length,
+    0,
+    'the refused entry reached the journal anyway',
+  )
+
+  // The same body on the token it names is accepted, so the refusal above is about the mismatch
+  // and not about the body being wrong in some other way.
+  const honest = await call('POST', '/entries', { token: 'svc-all', body: depositBody('1000') })
+  assert.equal(honest.status, 201)
+  assert.equal(honest.body['entry']!['originatingService'], 'wallet')
+})
+
+test('`actor` is bound too when it names a service, and left alone when it does not', { skip }, async () => {
+  // `service:<name>` is a claim about WHICH service, so it is checked.
+  const forged = await call('POST', '/entries', {
+    token: 'svc-all',
+    body: { ...depositBody('500'), actor: 'service:market' },
+  })
+  assert.equal(forged.status, 403)
+  assert.match(forged.body['error']!['message'], /service:market/)
+
+  // `system` and `user:<id>` are not claims about a service, and binding them would force a lie
+  // into every job-driven and operator-driven entry in the estate. Both must still post.
+  const system = await call('POST', '/entries', {
+    token: 'svc-all',
+    body: { ...depositBody('500'), actor: 'system' },
+  })
+  assert.equal(system.status, 201, 'a scheduled sweep may still post as `system`')
+
+  const operator = await call('POST', '/entries', {
+    token: 'svc-all',
+    body: { ...depositBody('500'), actor: 'user:11111111-1111-4111-8111-111111111111' },
+  })
+  assert.equal(operator.status, 201, 'an operator acting through a service may still be the actor')
+})
+
+test('the reversal route is bound as well — a correction cannot be signed by a stranger', { skip }, async () => {
+  const posted = await call('POST', '/entries', { token: 'svc-all', body: depositBody('700') })
+  const entryId = posted.body['entry']!['id'] as unknown as string
+
+  // Reversal is where this matters most. It is the route an operator reaches for during exactly
+  // the sort of incident that produced it, and an unattributable correction is how a mistake gets
+  // quietly attached to whoever is convenient.
+  const stranger = await call('POST', `/entries/${entryId}/reverse`, {
+    token: 'svc-market',
+    body: { originatingService: 'wallet', actor: 'service:wallet', idempotencyKey: freshKey() },
+  })
+  assert.equal(stranger.status, 403)
+
+  // The original is untouched by the refusal, and no reversal exists.
+  const trial = await call('GET', '/trial-balance', { token: 'svc-read' })
+  assert.equal(trial.body['entryCount'], 1, 'the refused reversal wrote a row')
+  assert.equal(trial.body['balanced'], true)
+})
+
+test('a reservation and its release are both bound', { skip }, async () => {
+  await call('POST', '/entries', { token: 'svc-all', body: depositBody('1000') })
+
+  const stranger = await call('POST', '/reservations', {
+    token: 'svc-all',
+    body: { subject: ALICE, assetCode: 'SHARD', amount: '400', originatingService: 'market', actor: 'service:market', idempotencyKey: freshKey() },
+  })
+  assert.equal(stranger.status, 403, 'a wallet token reserved under market\'s name')
+
+  const reserved = await call('POST', '/reservations', {
+    token: 'svc-market',
+    body: { subject: ALICE, assetCode: 'SHARD', amount: '400', originatingService: 'market', actor: 'service:market', idempotencyKey: freshKey() },
+  })
+  assert.equal(reserved.status, 201)
+  const reservationId = reserved.body['reservationId'] as unknown as string
+
+  const wrongRelease = await call('POST', `/reservations/${reservationId}/release`, {
+    token: 'svc-all',
+    body: { originatingService: 'market', actor: 'service:market', idempotencyKey: freshKey() },
+  })
+  assert.equal(wrongRelease.status, 403, 'a wallet token released market\'s reservation under market\'s name')
+
+  // And the money is still reserved, so the refusal did not half-happen.
+  const balances = await call('GET', `/accounts/${encodeURIComponent(ALICE)}/balances`, { token: 'svc-read' })
+  const byPurpose = Object.fromEntries(
+    (balances.body['balances'] as unknown as { purpose: string; amount: string }[]).map((b) => [b.purpose, b.amount]),
+  )
+  assert.equal(byPurpose['reserved'], '400')
+  assert.equal(byPurpose['available'], '600')
 })
