@@ -49,6 +49,26 @@ const post = (request: Parameters<typeof postEntry>[1]) =>
 const run = (assetCode: 'SHARD' | 'EMBER', tolerance: Record<string, bigint> = {}) =>
   reconcileAsset(db(), { assetCode, chain: 'platform', network: 'testnet', tolerance, producer: 'ledger' })
 
+/**
+ * An opening SHARD balance: custody up, the user's liability up, by the same amount.
+ *
+ * SHARD is the point of this file. It is the one asset with no chain behind it, which is what makes
+ * `observed_source = 'liability_sum'` legal for it and illegal for every other — so these cases
+ * cannot be re-denominated in EMBER without testing something else entirely.
+ *
+ * The kind is `adjustment` and NOT `deposit_credited`, which is what it used to be. SHARD is
+ * retired, and migration 13 refuses an acquisition denominated in a retired asset —
+ * `deposit_credited` among them, precisely because an asset with no chain cannot receive a deposit
+ * from one. An opening balance in a platform unit is an adjustment; calling it a deposit was
+ * always the wrong word, and the guard is what made the wrongness cost something.
+ */
+const shardBalance = (amount: bigint) =>
+  depositEntry({ amount, assetCode: 'SHARD', kind: 'adjustment' })
+
+/** The mirror, so a freeze can be shown to block a real withdrawal of a real holding. */
+const shardWithdrawal = (amount: bigint, kind?: Parameters<typeof withdrawalEntry>[0]['kind']) =>
+  withdrawalEntry({ amount, assetCode: 'SHARD', ...(kind ? { kind } : {}) })
+
 before(async () => {
   if (!enabled) return
   sql = openDb(8)
@@ -89,7 +109,7 @@ async function mintUnbackedLiability(amount: bigint): Promise<void> {
         assetCode: 'SHARD',
         sequence: 0,
       },
-      { account: userAccount(ALICE), direction: 'credit', amount, assetCode: 'SHARD', sequence: 1 },
+      { account: userAccount(ALICE, 'SHARD'), direction: 'credit', amount, assetCode: 'SHARD', sequence: 1 },
     ],
   })
 }
@@ -182,7 +202,7 @@ test('THE DEFECT: a deposit that never happened on chain reconciles CLEAN with n
 /* ================================================================== the invariant */
 
 test('a ledger where custody equals liabilities reconciles clean', { skip }, async () => {
-  await post(depositEntry({ amount: 5_000n }))
+  await post(shardBalance(5_000n))
 
   const result = await run('SHARD')
 
@@ -200,7 +220,7 @@ test('a ledger where custody equals liabilities reconciles clean', { skip }, asy
 })
 
 test('THE DEFECT: a liability minted with no custody behind it is caught', { skip }, async () => {
-  await post(depositEntry({ amount: 5_000n }))
+  await post(shardBalance(5_000n))
   await mintUnbackedLiability(1_000n)
 
   const result = await run('SHARD')
@@ -214,7 +234,7 @@ test('THE DEFECT: a liability minted with no custody behind it is caught', { ski
 })
 
 test('drift inside tolerance is recorded but does NOT freeze', { skip }, async () => {
-  await post(depositEntry({ amount: 5_000n }))
+  await post(shardBalance(5_000n))
   await mintUnbackedLiability(10n)
 
   const result = await run('SHARD', { SHARD: 100n })
@@ -226,7 +246,7 @@ test('drift inside tolerance is recorded but does NOT freeze', { skip }, async (
 })
 
 test('an asset with NO configured tolerance gets zero, not unlimited', { skip }, async () => {
-  await post(depositEntry({ amount: 5_000n }))
+  await post(shardBalance(5_000n))
   await mintUnbackedLiability(1n)
 
   // One unit of drift, no tolerance configured for SHARD. Failing closed is the whole point:
@@ -239,36 +259,36 @@ test('an asset with NO configured tolerance gets zero, not unlimited', { skip },
 /* ================================================================== the freeze */
 
 test('THE FREEZE: a withdrawal is refused while the asset is frozen', { skip }, async () => {
-  await post(depositEntry({ amount: 5_000n }))
+  await post(shardBalance(5_000n))
   await mintUnbackedLiability(1_000n)
   assert.equal((await run('SHARD')).froze, true)
 
   // The whole mechanical consequence of reconciliation. Without this the drift alert is a log line.
   await assert.rejects(
-    () => post(withdrawalEntry({ amount: 100n, kind: 'withdrawal_requested' })),
+    () => post(shardWithdrawal(100n, 'withdrawal_requested')),
     (err: unknown) => err instanceof AssetFrozenError && err.assetCode === 'SHARD',
   )
   await assert.rejects(
-    () => post(withdrawalEntry({ amount: 100n, kind: 'withdrawal_settled' })),
+    () => post(shardWithdrawal(100n, 'withdrawal_settled')),
     AssetFrozenError,
   )
 })
 
 test('THE FREEZE: deposits and refunds are NOT blocked', { skip }, async () => {
-  await post(depositEntry({ amount: 5_000n }))
+  await post(shardBalance(5_000n))
   await mintUnbackedLiability(1_000n)
   await run('SHARD')
 
   // The freeze stops value LEAVING the platform. Blocking a deposit would strand incoming money;
   // blocking a refund would harm the party the freeze exists to protect.
-  await assert.doesNotReject(() => post(depositEntry({ amount: 100n })))
+  await assert.doesNotReject(() => post(shardBalance(100n)))
   await assert.doesNotReject(() =>
-    post(withdrawalEntry({ amount: 100n, kind: 'withdrawal_refunded' })),
+    post(shardWithdrawal(100n, 'withdrawal_refunded')),
   )
 })
 
 test('THE FREEZE: another asset is unaffected', { skip }, async () => {
-  await post(depositEntry({ amount: 5_000n }))
+  await post(shardBalance(5_000n))
   await post(depositEntry({ amount: 5_000n, assetCode: 'EMBER' }))
   await mintUnbackedLiability(1_000n)
   await run('SHARD')
@@ -280,7 +300,7 @@ test('THE FREEZE: another asset is unaffected', { skip }, async () => {
 })
 
 test('a freeze is lifted only by an exactly-clean run, never by one merely within tolerance', { skip }, async () => {
-  await post(depositEntry({ amount: 5_000n }))
+  await post(shardBalance(5_000n))
   await mintUnbackedLiability(1_000n)
   assert.equal((await run('SHARD')).froze, true)
 
@@ -290,7 +310,7 @@ test('a freeze is lifted only by an exactly-clean run, never by one merely withi
   assert.equal(withinTolerance.status, 'drift_within_tolerance')
   assert.equal(withinTolerance.unfroze, false)
   assert.equal((await listFreezes(db())).length, 1, 'the freeze must persist')
-  await assert.rejects(() => post(withdrawalEntry({ amount: 10n })), AssetFrozenError)
+  await assert.rejects(() => post(shardWithdrawal(10n)), AssetFrozenError)
 
   // Correct the drift properly: move the unbacked amount into custody.
   await post({
@@ -315,11 +335,11 @@ test('a freeze is lifted only by an exactly-clean run, never by one merely withi
   assert.equal(clean.status, 'clean')
   assert.equal(clean.unfroze, true)
   assert.deepEqual(await listFreezes(db()), [])
-  await assert.doesNotReject(() => post(withdrawalEntry({ amount: 10n })))
+  await assert.doesNotReject(() => post(shardWithdrawal(10n)))
 })
 
 test('a freeze records the run that caused it, and refreshes on the latest run', { skip }, async () => {
-  await post(depositEntry({ amount: 5_000n }))
+  await post(shardBalance(5_000n))
   await mintUnbackedLiability(1_000n)
 
   const first = await run('SHARD')
@@ -632,7 +652,7 @@ const outboxRows = async (topic: string): Promise<StoredOutboxRow[]> =>
   `
 
 test('THE FIX: a completed reconciliation announces itself, keyed the registry’s way', { skip }, async () => {
-  await post(depositEntry({ amount: 5_000n }))
+  await post(shardBalance(5_000n))
   const result = await run('SHARD')
 
   const rows = await outboxRows(RECONCILIATION_COMPLETED)
@@ -666,7 +686,7 @@ test('THE FIX: a completed reconciliation announces itself, keyed the registry�
 })
 
 test('THE READER: activity can read the drift off a real event, and a freeze is on the wire', { skip }, async () => {
-  await post(depositEntry({ amount: 5_000n }))
+  await post(shardBalance(5_000n))
   await mintUnbackedLiability(1_000n)
   const result = await run('SHARD')
   assert.equal(result.froze, true, 'the fixture must actually freeze, or this asserts nothing')
@@ -710,7 +730,7 @@ test('THE READER: activity can read the drift off a real event, and a freeze is 
 test('the event and the run row commit together, or neither does', { skip }, async () => {
   // Rule 5 of docs/ecosystem/03 §2. Emitting after commit drops the event when the process dies in
   // the gap — and the event this would drop is the one saying withdrawals just stopped.
-  await post(depositEntry({ amount: 5_000n }))
+  await post(shardBalance(5_000n))
   await run('SHARD')
   const runs = await latestRuns(db())
   const events = await outboxRows(RECONCILIATION_COMPLETED)
@@ -732,7 +752,7 @@ test('the two totals are read in ONE snapshot, so a concurrent posting cannot in
   // The race itself is not reproducible from here without controlling statement interleaving, so
   // what is asserted is the property that makes it impossible: the whole run is one transaction, so
   // a failure part-way leaves neither a run row nor an event.
-  await post(depositEntry({ amount: 5_000n }))
+  await post(shardBalance(5_000n))
   const before = (await latestRuns(db())).length
   await assert.rejects(
     () =>

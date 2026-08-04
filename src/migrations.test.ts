@@ -2,6 +2,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { checksumOf } from '@cloudsforge/db'
 import { ENTRY_KINDS } from '@cloudsforge/contracts-money'
+import { RETIRED_ASSETS } from '@cloudsforge/contracts-chain'
+import { ACQUISITION_KINDS } from './entries.ts'
 import { BASELINE_VERSION, MIGRATIONS, SCHEMA_VERSION } from './migrations.ts'
 
 const sql = MIGRATIONS.map((m) => m.up).join('\n')
@@ -205,4 +207,62 @@ test('the balances shadow carries no overdraft trigger, so a rebuild cannot supp
   assert.ok(shadow)
   assert.doesNotMatch(statementsOf(shadow.up), /trigger/i)
   assert.doesNotMatch(statementsOf(shadow.up), /references accounts/i)
+})
+
+/* ------------------------------------------------------ migration 13, the retired-asset guard */
+
+/**
+ * The kinds migration 13 refuses a retired asset on, read out of the SQL rather than restated.
+ *
+ * A narrow parse that fails loudly. A regex that quietly matched nothing would make every
+ * assertion below vacuous, which is the exact failure mode the guard itself exists to avoid.
+ */
+function acquisitionKindsInSql(): readonly string[] {
+  const guard = MIGRATIONS.find((m) => m.name === 'retired_asset_guard')
+  assert.ok(guard, 'migration 13 is missing')
+  const clause = /if entry_kind in \(([^)]*)\) then/.exec(guard.up)
+  assert.ok(clause?.[1], 'the kind list could not be read out of migration 13')
+  return [...clause[1].matchAll(/'([a-z_]+)'/g)].map((m) => m[1]!)
+}
+
+test('every kind migration 13 names is a real entry kind, so the rule cannot match nothing', () => {
+  const listed = acquisitionKindsInSql()
+  assert.ok(listed.length > 0)
+  for (const kind of listed) {
+    // A typo here does not fail: it produces a comparison that is simply never true, and a guard
+    // that silently never fires. `journal_entries_kind_chk` is the closed vocabulary, so membership
+    // of ENTRY_KINDS is the whole test.
+    assert.ok(ENTRY_KINDS.includes(kind as never), `migration 13 names '${kind}', which is not an entry kind`)
+  }
+})
+
+test('the SQL and the application agree about which kinds are acquisitions', () => {
+  // Two copies, deliberately: the database is the enforcement point and the application is what
+  // gives a caller a named diagnosis before a connection is taken. They may not disagree, or a
+  // caller is told one thing and refused for another.
+  assert.deepEqual([...acquisitionKindsInSql()].sort(), [...ACQUISITION_KINDS].sort())
+})
+
+test('the retired set is seeded as ROWS, never inlined into the rule', () => {
+  const guard = MIGRATIONS.find((m) => m.name === 'retired_asset_guard')!
+  // The same discipline migration 11 applies to chain_assets, and for the same two reasons: an
+  // inline list is a second declaration of RETIRED_ASSETS free to drift, and generating one into
+  // this string would change an APPLIED migration's checksum the day a second asset is wound down.
+  assert.match(guard.up, /insert into retired_assets \(asset_code, retired_on, note\) values/)
+  assert.doesNotMatch(
+    statementsOf(guard.up).replace(/insert into retired_assets[\s\S]*?on conflict[^;]*;/, ''),
+    /'SHARD'/,
+    'the retired asset is named outside its seed row — that is the second list this design avoids',
+  )
+  // Every code seeded must be one contracts-chain actually retired. `entries.test.ts` asserts the
+  // other direction against the live table.
+  const seeded = [...statementsOf(guard.up).matchAll(/\('([A-Z]+)',\s*\n?\s*date '/g)].map((m) => m[1]!)
+  assert.deepEqual(seeded.sort(), [...RETIRED_ASSETS].sort())
+})
+
+test('retired_assets cannot be emptied by anyone who is not the table owner', () => {
+  const guard = MIGRATIONS.find((m) => m.name === 'retired_asset_guard')!
+  // Without this, "make the charge go through" is one DELETE away, and the row that says an asset
+  // is wound down is the only thing standing between a retired unit and a customer's balance.
+  assert.match(guard.up, /revoke update, delete, truncate on retired_assets from public/)
 })

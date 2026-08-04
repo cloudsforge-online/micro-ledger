@@ -128,17 +128,17 @@ const depositBody = (amount: string, idempotencyKey = freshKey()) => ({
   idempotencyKey,
   postings: [
     {
-      account: { subject: 'custody', assetCode: 'SHARD', purpose: 'treasury', type: 'asset' },
+      account: { subject: 'custody', assetCode: 'EMBER', purpose: 'treasury', type: 'asset' },
       direction: 'debit',
       amount,
-      assetCode: 'SHARD',
+      assetCode: 'EMBER',
       sequence: 0,
     },
     {
-      account: { subject: ALICE, assetCode: 'SHARD', purpose: 'available', type: 'liability' },
+      account: { subject: ALICE, assetCode: 'EMBER', purpose: 'available', type: 'liability' },
       direction: 'credit',
       amount,
-      assetCode: 'SHARD',
+      assetCode: 'EMBER',
       sequence: 1,
     },
   ],
@@ -200,7 +200,7 @@ test('scopes are enforced per route', { skip }, async () => {
   // A posting token may not reserve: three authorities, not one.
   const reserved = await call('POST', '/reservations', {
     token: 'svc-post',
-    body: { subject: ALICE, assetCode: 'SHARD', amount: '10', originatingService: 'market', actor: 'service:market', idempotencyKey: freshKey() },
+    body: { subject: ALICE, assetCode: 'EMBER', amount: '10', originatingService: 'market', actor: 'service:market', idempotencyKey: freshKey() },
   })
   assert.equal(reserved.status, 403)
   assert.match(reserved.body['error']!['message'], /ledger:reserve/)
@@ -245,7 +245,31 @@ test('an unbalanced entry is 400 and names the asset and the difference', { skip
   const response = await call('POST', '/entries', { token: 'svc-all', body })
   assert.equal(response.status, 400)
   assert.equal(response.body['error']!['code'], 'invalid_entry')
-  assert.match(JSON.stringify(response.body['error']!['problems']), /SHARD is out by 1/)
+  assert.match(JSON.stringify(response.body['error']!['problems']), /EMBER is out by 1/)
+})
+
+test('a purchase in a retired asset is 400 retired_asset, named so the caller can act', { skip }, async () => {
+  // The wire half of migration 13. `invalid_entry` would tell micro-mint to retry; `retired_asset`
+  // tells it to change what it settles in, which is the only thing that will ever work.
+  const response = await call('POST', '/entries', {
+    token: 'svc-all',
+    body: {
+      kind: 'purchase',
+      // 'wallet', not 'mint': the token binds `originatingService` to the service it was issued
+      // to, and a stranger's name on a movement of money is a 403 before any of this is reached.
+      // The refusal under test is about the ASSET, so the caller must first be allowed to speak.
+      originatingService: 'wallet',
+      actor: 'system',
+      idempotencyKey: freshKey(),
+      postings: [
+        { account: { subject: ALICE, assetCode: 'SHARD', purpose: 'available', type: 'liability' }, direction: 'debit', amount: '2500', assetCode: 'SHARD', sequence: 0 },
+        { account: { subject: 'platform', assetCode: 'SHARD', purpose: 'fees', type: 'revenue' }, direction: 'credit', amount: '2500', assetCode: 'SHARD', sequence: 1 },
+      ],
+    },
+  })
+  assert.equal(response.status, 400)
+  assert.equal(response.body['error']!['code'], 'retired_asset')
+  assert.equal(response.body['error']!['assetCode'], 'SHARD')
 })
 
 test('overspending is 409, not 400 — the request was well formed', { skip }, async () => {
@@ -258,8 +282,8 @@ test('overspending is 409, not 400 — the request was well formed', { skip }, a
       actor: 'system',
       idempotencyKey: freshKey(),
       postings: [
-        { account: { subject: ALICE, assetCode: 'SHARD', purpose: 'available', type: 'liability' }, direction: 'debit', amount: '500', assetCode: 'SHARD', sequence: 0 },
-        { account: { subject: 'custody', assetCode: 'SHARD', purpose: 'treasury', type: 'asset' }, direction: 'credit', amount: '500', assetCode: 'SHARD', sequence: 1 },
+        { account: { subject: ALICE, assetCode: 'EMBER', purpose: 'available', type: 'liability' }, direction: 'debit', amount: '500', assetCode: 'EMBER', sequence: 0 },
+        { account: { subject: 'custody', assetCode: 'EMBER', purpose: 'treasury', type: 'asset' }, direction: 'credit', amount: '500', assetCode: 'EMBER', sequence: 1 },
       ],
     },
   })
@@ -321,7 +345,7 @@ test('a reservation round-trips through HTTP', { skip }, async () => {
 
   const reserved = await call('POST', '/reservations', {
     token: 'svc-market',
-    body: { subject: ALICE, assetCode: 'SHARD', amount: '400', originatingService: 'market', actor: 'service:market', idempotencyKey: freshKey() },
+    body: { subject: ALICE, assetCode: 'EMBER', amount: '400', originatingService: 'market', actor: 'service:market', idempotencyKey: freshKey() },
   })
   assert.equal(reserved.status, 201)
   const reservationId = reserved.body['reservationId'] as unknown as string
@@ -482,13 +506,13 @@ test('a reservation and its release are both bound', { skip }, async () => {
 
   const stranger = await call('POST', '/reservations', {
     token: 'svc-all',
-    body: { subject: ALICE, assetCode: 'SHARD', amount: '400', originatingService: 'market', actor: 'service:market', idempotencyKey: freshKey() },
+    body: { subject: ALICE, assetCode: 'EMBER', amount: '400', originatingService: 'market', actor: 'service:market', idempotencyKey: freshKey() },
   })
   assert.equal(stranger.status, 403, 'a wallet token reserved under market\'s name')
 
   const reserved = await call('POST', '/reservations', {
     token: 'svc-market',
-    body: { subject: ALICE, assetCode: 'SHARD', amount: '400', originatingService: 'market', actor: 'service:market', idempotencyKey: freshKey() },
+    body: { subject: ALICE, assetCode: 'EMBER', amount: '400', originatingService: 'market', actor: 'service:market', idempotencyKey: freshKey() },
   })
   assert.equal(reserved.status, 201)
   const reservationId = reserved.body['reservationId'] as unknown as string

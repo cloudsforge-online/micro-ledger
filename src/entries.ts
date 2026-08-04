@@ -14,6 +14,14 @@
  *     projection and the outbox row all commit together or not at all.
  *   * Translating the database's invariant violations into diagnoses a caller can act on.
  *   * Refusing to post at all when reconciliation has frozen the asset for withdrawals.
+ *   * Refusing to denominate an ACQUISITION in a retired asset — `ACQUISITION_KINDS` below.
+ *
+ * The last of those looks like the business rule the first paragraph forbids, and it is worth
+ * saying why it is not. It carries no product knowledge: it does not know what a deploy costs or
+ * which service is selling. It is a fact about an ASSET's lifecycle, the same class of fact as the
+ * withdrawal freeze one line above, and it is owned here for the same reason — the asset is the
+ * ledger's, and a rule about it that lives in each of a dozen callers is a rule the thirteenth
+ * caller has never heard of. `micro-mint` was that thirteenth caller.
  *
  * The arithmetic itself — balancing, the sign convention, reversal, reservation pairs — is
  * `@cloudsforge/contracts-money` and is not reimplemented here. A second copy of `normalBalance`
@@ -32,11 +40,13 @@ import {
   balanceEntry,
   describeBalanceProblem,
   increasesBalance,
+  isChainAsset,
   isEntryKind,
   releasePostings,
   reservePostings,
   reverseEntry,
 } from '@cloudsforge/contracts-money'
+import { isRetiredAsset } from '@cloudsforge/contracts-chain'
 import {
   type AccountRecord,
   type EnsureAccountInput,
@@ -86,6 +96,27 @@ export class AssetFrozenError extends Error {
     this.name = 'AssetFrozenError'
     this.assetCode = assetCode
     this.reason = reason
+  }
+}
+
+/**
+ * The entry would have acquired a wound-down asset. 400, and a caller that has not migrated.
+ *
+ * Distinct from `LedgerValidationError` so the answer says WHICH rule refused. A caller told only
+ * "invalid entry" retries; a caller told "SHARD is retired" changes its settlement asset.
+ */
+export class RetiredAssetError extends Error {
+  readonly assetCode: string
+  readonly kind: string
+  constructor(assetCode: string, kind: EntryKind) {
+    super(
+      `${assetCode} is retired and may not be acquired: an entry of kind ${kind} may not be ` +
+        'denominated in it. Existing holdings are unaffected — they may still be transferred, ' +
+        'converted, adjusted, reversed and withdrawn.',
+    )
+    this.name = 'RetiredAssetError'
+    this.assetCode = assetCode
+    this.kind = kind
   }
 }
 
@@ -224,6 +255,31 @@ const CORRECTION_KINDS: ReadonlySet<EntryKind> = new Set<EntryKind>([
   'reversal',
 ])
 
+/**
+ * The kinds by which value is ACQUIRED, and therefore the only ones a retired asset is refused on.
+ *
+ * The database says the same thing in migration 13, which is the enforcement point; this copy
+ * exists so a caller gets a named diagnosis before a connection is taken, exactly as
+ * `validateEntryRequest`'s balance check mirrors the deferred trigger. Migration 13 argues the
+ * membership at length. In short:
+ *
+ *   * `purchase` / `subscription_charge` — something being SOLD for a wound-down unit. The
+ *     ledger-side twin of `billing`'s `prices_no_new_shard`, needed because a service can post a
+ *     charge without ever consulting a catalogue. `micro-mint` did exactly that.
+ *   * `deposit_credited` — value arriving from a chain, when the asset has no chain.
+ *
+ * **What is deliberately absent is the whole point.** Every kind by which a holder gets their
+ * money OUT — `withdrawal_requested`, `withdrawal_settled`, `withdrawal_refunded`, `conversion`,
+ * `transfer` — and every kind by which a wrong balance is fixed stays legal. 69,000 SHARD sit in
+ * 69 live accounts; a rule that refused those kinds would strand every unit of it, which is a
+ * worse defect than the one this exists to fix.
+ */
+export const ACQUISITION_KINDS: ReadonlySet<EntryKind> = new Set<EntryKind>([
+  'purchase',
+  'subscription_charge',
+  'deposit_credited',
+])
+
 /* ------------------------------------------------------------------------ error mapping */
 
 interface PgError {
@@ -255,6 +311,16 @@ export function mapDatabaseError(err: unknown): unknown {
   }
   if (/may not go negative/.test(message)) {
     return new InsufficientFundsError(message)
+  }
+  if (/is retired and may not be acquired/.test(message)) {
+    // Reachable when a posting arrives by a route that skipped `validateEntryRequest`, or when the
+    // retired set was widened by a migration this build's `RETIRED_ASSETS` predates. Both are
+    // exactly why the rule is in the schema; the asset and kind are recovered from the message
+    // rather than guessed so the answer is as specific as the one the application would have given.
+    const detail = /^(\S+) is retired .* of kind (\S+)/.exec(message)
+    return detail
+      ? new RetiredAssetError(detail[1]!, detail[2] as EntryKind)
+      : new LedgerValidationError(message)
   }
   if (/append-only/.test(message)) {
     return new ImmutableError(message)
@@ -295,6 +361,16 @@ export function validateEntryRequest(request: PostEntryRequest): void {
     }
     if (posting.accountId && !isUuid(posting.accountId)) {
       throw new LedgerValidationError(`posting ${index} accountId must be a uuid`)
+    }
+    // `isChainAsset` first: `isRetiredAsset` is typed against contracts-chain's `AssetCode`, and a
+    // `TOKEN:<urn>` or `USD` code is a `LedgerAssetCode` that is not one. Narrowing rather than
+    // casting is what stops a token whose symbol happens to be a retired code being refused.
+    if (
+      ACQUISITION_KINDS.has(request.kind) &&
+      isChainAsset(posting.assetCode) &&
+      isRetiredAsset(posting.assetCode)
+    ) {
+      throw new RetiredAssetError(posting.assetCode, request.kind)
     }
   }
 

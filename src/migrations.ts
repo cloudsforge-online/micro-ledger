@@ -856,6 +856,148 @@ export const MIGRATIONS: readonly Migration[] = [
         where unobserved_reason is not null;
     `,
   },
+
+  {
+    version: 13,
+    name: 'retired_asset_guard',
+    up: `
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+      -- A RETIRED ASSET MAY NOT BE THE CONSIDERATION FOR A SALE.
+      --
+      -- SHARD was retired on 2026-08-04 — contracts/packages/chain/src/index.ts, RETIRED_ASSETS
+      -- and IssuableAssetCode — and micro-billing closed its half the same day with
+      -- 'prices_no_new_shard' (billing/src/migrations.ts, migration 11). Its argument is the
+      -- argument for this one, quoted because it is the reason this lives here rather than only in
+      -- a handler: "A comment does not stop an INSERT."
+      --
+      -- Billing stopped a retired PRICE existing. It could not stop a retired CHARGE, because a
+      -- charge is not billing's row — it is a posting, and postings are here. micro-mint was never
+      -- migrated: it priced a deploy in Shards, served the number as priceShards, and posted
+      -- kind='purchase' with assetCode='SHARD' straight into this table. Nothing in this schema
+      -- said no. The customer's screen said "Pay 2,500 Shards" and it was TRUE, which is why the
+      -- surface could not be fixed by relabelling it.
+      --
+      -- ── WHAT THIS REFUSES, AND — MORE IMPORTANTLY — WHAT IT DOES NOT ─────────────────────────
+      --
+      -- 121 SHARD accounts exist in the live ledger right now; 120 are user liabilities and 69 of
+      -- those hold a balance, summing to 69,000 units, matched by one custody asset account of the
+      -- same 69,000. That money is real and it belongs to people. **Retiring an asset must never
+      -- strand it**, so the rule here is deliberately NOT "no posting may name a retired asset".
+      -- Such a rule would refuse the withdrawal, the transfer, the conversion to EMBER, the
+      -- reconciliation correction and the reversal — every route by which those 69,000 units can
+      -- ever leave — and would convert a pricing defect into 69 frozen balances. A guard that
+      -- traps a holder's own money is a worse defect than the one it fixes.
+      --
+      -- So the refusal is scoped to ACQUISITION kinds, and nothing else:
+      --
+      --   * 'purchase' and 'subscription_charge' — a product being SOLD for a wound-down unit.
+      --     This is the exact ledger-side twin of billing's 'prices_no_new_shard': billing stops
+      --     the price row, this stops the charge, and the second is needed because a service can
+      --     post a charge without ever consulting a catalogue. micro-mint did.
+      --   * 'deposit_credited' — value arriving from a chain. SHARD has no chain (jobs.ts,
+      --     chainNameFor records it as the synthetic 'platform'), so a SHARD deposit could only
+      --     ever be a fabrication, and refusing it costs nothing today and closes a route later.
+      --
+      -- Every other kind stays legal, and each one is a route money must keep taking:
+      -- withdrawal_requested / withdrawal_settled / withdrawal_refunded (out), conversion (to
+      -- EMBER — this is how the balances are meant to drain), transfer, adjustment,
+      -- reconciliation_correction, reversal, and the engagement/market/trade kinds that live
+      -- services still post in SHARD today (reward_granted, treasury_spend, trading_fill,
+      -- performance_fee). Those last four are a REMAINING GAP, not an oversight: they can still
+      -- put new SHARD into a holder's hands, and closing them means migrating micro-emberkin,
+      -- micro-worlds, micro-market and micro-trade first. Tightening this trigger before those
+      -- services move would break live paths in repositories this change does not own, which is
+      -- the one thing a money-layer guard may not do.
+      --
+      -- ── WHY A TABLE AND A TRIGGER RATHER THAN A CHECK ────────────────────────────────────────
+      --
+      -- A CHECK cannot see across tables, and the rule is a JOIN: it is a property of the posting's
+      -- asset AND of its entry's kind. So it is a trigger, the same mechanism INVARIANT 1 uses.
+      --
+      -- The asset list is a TABLE and not a literal inlined in the function body, for the two
+      -- reasons migration 11 sets out about chain_assets and which apply unchanged here: an inline
+      -- list is a second declaration of RETIRED_ASSETS free to drift from the first in silence,
+      -- and generating it into this string would change an APPLIED migration's checksum the day a
+      -- second asset is wound down, so every deployment would refuse to start. Retiring the next
+      -- asset is a new migration inserting one row — a schema event that leaves a version behind,
+      -- and one that tightens this rule across every service at once with no code change anywhere.
+      -- 'entries.test.ts' asserts this table's contents equal RETIRED_ASSETS, so the copy cannot go
+      -- stale without a red test naming it.
+      --
+      -- The KIND list is inline, and that asymmetry is deliberate. Which kinds constitute an
+      -- acquisition is a property of this rule, decided once and argued above; it is not
+      -- configuration, and an operator who could UPDATE it could re-open the exact hole this
+      -- closes. It is in the checksummed migration text, where it cannot be edited after the fact.
+      -- 'migrations.test.ts' asserts every kind named here is a member of ENTRY_KINDS, so a typo
+      -- cannot produce a rule that silently matches nothing.
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+
+      create table if not exists retired_assets (
+        asset_code text primary key,
+        -- When the estate stopped issuing it, and why. Read by nothing; it exists to be read by a
+        -- person asking why a posting was refused.
+        retired_on date not null,
+        note       text not null
+      );
+
+      insert into retired_assets (asset_code, retired_on, note) values
+        ('SHARD',
+         date '2026-08-04',
+         'RETIRED_ASSETS[0] in contracts-chain. Balances stay readable and movable until drained; ' ||
+         'see contracts 218300b and billing 2fe6d81.')
+      on conflict (asset_code) do nothing;
+
+      -- The same two mechanisms INVARIANT 2 uses on postings, for the same reason: the REVOKE binds
+      -- every role that is not the owner, and an asset must not stop being retired because somebody
+      -- with a psql session deleted a row to get a charge through.
+      revoke update, delete, truncate on retired_assets from public;
+      grant select on retired_assets to public;
+
+      create or replace function ledger_refuse_retired_acquisition() returns trigger
+        language plpgsql
+      as $$
+      declare
+        entry_kind text;
+      begin
+        -- Cheapest test first: almost every posting in this ledger is in a live asset, and this
+        -- trigger fires on every one of them.
+        if not exists (select 1 from retired_assets where asset_code = new.asset_code) then
+          return null;
+        end if;
+
+        -- postings.entry_id is a foreign key into journal_entries, so the row is always present by
+        -- the time this fires. Read rather than assumed all the same: a null kind here would make
+        -- the comparison below null, and a null is not a refusal.
+        select kind into entry_kind from journal_entries where id = new.entry_id;
+        if entry_kind is null then
+          raise exception
+            'posting % names entry % which has no kind', new.id, new.entry_id
+            using errcode = 'check_violation';
+        end if;
+
+        if entry_kind in ('purchase', 'subscription_charge', 'deposit_credited') then
+          raise exception
+            '% is retired and may not be acquired: an entry of kind % may not be denominated in it. '
+            'Existing holdings are unaffected — they may still be transferred, converted, adjusted, '
+            'reversed and withdrawn.',
+            new.asset_code, entry_kind
+            using errcode = 'check_violation';
+        end if;
+
+        return null;
+      end;
+      $$;
+
+      -- AFTER INSERT and NOT deferred, unlike the balancing trigger. Balancing has to be deferred
+      -- because an entry is legitimately unbalanced between its first posting and its last; this
+      -- rule is decidable from one row the moment it is written, and failing at the INSERT names
+      -- the offending posting instead of failing the whole COMMIT with no line to point at.
+      drop trigger if exists postings_no_retired_acquisition on postings;
+      create trigger postings_no_retired_acquisition
+        after insert on postings
+        for each row execute function ledger_refuse_retired_acquisition();
+    `,
+  },
 ]
 
 /**

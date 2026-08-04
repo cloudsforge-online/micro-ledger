@@ -38,6 +38,7 @@ import {
   InsufficientFundsError,
   LedgerValidationError,
   NotFoundError,
+  RetiredAssetError,
   UnbalancedEntryError,
   type EntryView,
   type PostEntryDeps,
@@ -337,6 +338,12 @@ async function handle(route: Route | undefined, ctx: RequestContext, deps: Serve
       // a bug in this service or a posting that arrived by another route.
       ctx.log.error('the deferred balancing trigger refused an entry', { err })
       return errorReply(400, 'unbalanced_entry', err.message, ctx.requestId)
+    }
+    if (err instanceof RetiredAssetError) {
+      // Logged at warn, not info: every one of these is an unmigrated caller still trying to charge
+      // in a wound-down unit, and the operator wants to know WHICH service before a customer does.
+      ctx.log.warn('entry refused: retired asset', { asset: err.assetCode, kind: err.kind })
+      return errorReply(400, 'retired_asset', err.message, ctx.requestId, { assetCode: err.assetCode })
     }
     if (err instanceof UnknownAccountError) {
       return errorReply(400, 'unknown_account', err.message, ctx.requestId)

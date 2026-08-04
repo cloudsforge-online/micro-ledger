@@ -214,7 +214,7 @@ test('CONCURRENCY: an unbalanced entry under load is refused without disturbing 
     `
     await tx`
       insert into postings (entry_id, account_id, direction, amount, asset_code, sequence)
-      values (${entryId}, ${account[0]!.id}, 'credit', 999, 'SHARD', 0)
+      values (${entryId}, ${account[0]!.id}, 'credit', 999, 'EMBER', 0)
     `
     return { value: null }
   })

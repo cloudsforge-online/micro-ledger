@@ -16,6 +16,7 @@ import {
   InsufficientFundsError,
   LedgerValidationError,
   NotFoundError,
+  RetiredAssetError,
   listEntries,
   postEntry,
   readEntry,
@@ -27,6 +28,7 @@ import {
 } from './entries.ts'
 import { IdempotencyKeyReuseError, requestFingerprint } from './idempotency.ts'
 import { balancesForSubject } from './accounts.ts'
+import { RETIRED_ASSETS } from '@cloudsforge/contracts-chain'
 import { uuidv7 } from './ids.ts'
 import {
   ALICE,
@@ -70,7 +72,7 @@ beforeEach(async () => {
 })
 
 /** The balance of one account, as the projection holds it. */
-async function balanceOf(subject: string, purpose = 'available', assetCode = 'SHARD'): Promise<bigint> {
+async function balanceOf(subject: string, purpose = 'available', assetCode = 'EMBER'): Promise<bigint> {
   const balances = await balancesForSubject(db(), subject)
   const found = balances.find((b) => b.purpose === purpose && b.assetCode === assetCode)
   return BigInt(found?.amount ?? '0')
@@ -93,9 +95,15 @@ test('a balanced entry commits, and moves both sides', { skip }, async () => {
 })
 
 test('an entry may touch two assets at once, and each balances separately', { skip }, async () => {
-  // A conversion: the user's EMBER falls and their Shards rise. The two totals have no arithmetic
+  // A conversion: the user's Shards fall and their EMBER rises. The two totals have no arithmetic
   // relationship, which is exactly why the invariant is per asset rather than per entry.
-  await post(depositEntry({ amount: 5_000_000_000_000_000_000n, assetCode: 'EMBER' }))
+  //
+  // The direction is deliberate and it is the reverse of what this case used to assert. SHARD is
+  // retired (migration 13), and this entry is THE ROUTE OUT — the one by which 69,000 live units
+  // become EMBER. `conversion` is not in `ACQUISITION_KINDS` precisely so that this keeps working;
+  // a guard that refused it would leave every holder unable to leave the asset being wound down,
+  // which is a worse defect than a service still charging in it.
+  await post(depositEntry({ amount: 5_000n, assetCode: 'SHARD', kind: 'adjustment' }))
 
   await post({
     kind: 'conversion',
@@ -104,15 +112,15 @@ test('an entry may touch two assets at once, and each balances separately', { sk
     correlationId: 'c-convert',
     idempotencyKey: freshKey(),
     postings: [
-      { account: userAccount(ALICE, 'EMBER'), direction: 'debit', amount: 1_000_000_000_000_000_000n, assetCode: 'EMBER', sequence: 0 },
-      { account: custodyAccount('EMBER'), direction: 'credit', amount: 1_000_000_000_000_000_000n, assetCode: 'EMBER', sequence: 1 },
-      { account: custodyAccount('SHARD'), direction: 'debit', amount: 250n, assetCode: 'SHARD', sequence: 2 },
-      { account: userAccount(ALICE, 'SHARD'), direction: 'credit', amount: 250n, assetCode: 'SHARD', sequence: 3 },
+      { account: userAccount(ALICE, 'SHARD'), direction: 'debit', amount: 1_000n, assetCode: 'SHARD', sequence: 0 },
+      { account: custodyAccount('SHARD'), direction: 'credit', amount: 1_000n, assetCode: 'SHARD', sequence: 1 },
+      { account: custodyAccount('EMBER'), direction: 'debit', amount: 1_000_000_000_000_000_000n, assetCode: 'EMBER', sequence: 2 },
+      { account: userAccount(ALICE, 'EMBER'), direction: 'credit', amount: 1_000_000_000_000_000_000n, assetCode: 'EMBER', sequence: 3 },
     ],
   })
 
-  assert.equal(await balanceOf(ALICE, 'available', 'EMBER'), 4_000_000_000_000_000_000n)
-  assert.equal(await balanceOf(ALICE, 'available', 'SHARD'), 250n)
+  assert.equal(await balanceOf(ALICE, 'available', 'SHARD'), 4_000n)
+  assert.equal(await balanceOf(ALICE, 'available', 'EMBER'), 1_000_000_000_000_000_000n)
   assert.equal((await trialBalance(db())).balanced, true)
 })
 
@@ -136,8 +144,8 @@ test(
     // legal entry.
     const accounts = await sql<{ id: string }[]>`
       insert into accounts (subject, type, asset_code, purpose) values
-        ('custody', 'asset', 'SHARD', 'treasury'),
-        (${ALICE}, 'liability', 'SHARD', 'available')
+        ('custody', 'asset', 'EMBER', 'treasury'),
+        (${ALICE}, 'liability', 'EMBER', 'available')
       returning id
     `
     const entryId = uuidv7()
@@ -152,17 +160,17 @@ test(
           `
           await tx`
             insert into postings (entry_id, account_id, direction, amount, asset_code, sequence)
-            values (${entryId}, ${accounts[0]!.id}, 'debit', 100, 'SHARD', 0)
+            values (${entryId}, ${accounts[0]!.id}, 'debit', 100, 'EMBER', 0)
           `
           await tx`
             insert into postings (entry_id, account_id, direction, amount, asset_code, sequence)
-            values (${entryId}, ${accounts[1]!.id}, 'credit', 99, 'SHARD', 1)
+            values (${entryId}, ${accounts[1]!.id}, 'credit', 99, 'EMBER', 1)
           `
           // Every statement above succeeded. Nothing has complained yet, and that is the point.
           insertsSucceeded = true
           return { value: null }
         }),
-      /does not balance for SHARD: debits 100, credits 99, out by 1/,
+      /does not balance for EMBER: debits 100, credits 99, out by 1/,
     )
 
     assert.equal(insertsSucceeded, true, 'the inserts must succeed; the check belongs at COMMIT')
@@ -199,7 +207,7 @@ test('postings appended to a committed entry in a later transaction also fail', 
       sql.begin(async (tx) => {
         await tx`
           insert into postings (entry_id, account_id, direction, amount, asset_code, sequence)
-          values (${outcome.result.id}, ${account[0]!.id}, 'credit', 5, 'SHARD', 99)
+          values (${outcome.result.id}, ${account[0]!.id}, 'credit', 5, 'EMBER', 99)
         `
         return { value: null }
       }),
@@ -217,12 +225,12 @@ test('the application refuses an unbalanced entry with a diagnosis, before the d
         correlationId: 'c',
         idempotencyKey: freshKey(),
         postings: [
-          { account: custodyAccount(), direction: 'debit', amount: 100n, assetCode: 'SHARD', sequence: 0 },
-          { account: userAccount(ALICE), direction: 'credit', amount: 99n, assetCode: 'SHARD', sequence: 1 },
+          { account: custodyAccount(), direction: 'debit', amount: 100n, assetCode: 'EMBER', sequence: 0 },
+          { account: userAccount(ALICE), direction: 'credit', amount: 99n, assetCode: 'EMBER', sequence: 1 },
         ],
       }),
     (err: unknown) =>
-      err instanceof LedgerValidationError && err.problems.some((p) => /SHARD is out by 1/.test(p)),
+      err instanceof LedgerValidationError && err.problems.some((p) => /EMBER is out by 1/.test(p)),
   )
   assert.equal((await sql`select id from journal_entries`).length, 0)
 })
@@ -339,13 +347,13 @@ test('an overdraft-allowed account may go negative', { skip }, async () => {
     idempotencyKey: freshKey(),
     postings: [
       {
-        account: { subject: 'clearing', assetCode: 'SHARD', purpose: 'suspense', type: 'clearing', overdraftAllowed: true },
+        account: { subject: 'clearing', assetCode: 'EMBER', purpose: 'suspense', type: 'clearing', overdraftAllowed: true },
         direction: 'debit',
         amount: 50n,
-        assetCode: 'SHARD',
+        assetCode: 'EMBER',
         sequence: 0,
       },
-      { account: userAccount(ALICE), direction: 'credit', amount: 50n, assetCode: 'SHARD', sequence: 1 },
+      { account: userAccount(ALICE), direction: 'credit', amount: 50n, assetCode: 'EMBER', sequence: 1 },
     ],
   })
   assert.equal(await balanceOf('clearing', 'suspense'), -50n)
@@ -426,7 +434,7 @@ test('a reservation is a posting pair from available to reserved', { skip }, asy
     deps(),
     {
       subject: ALICE,
-      assetCode: 'SHARD',
+      assetCode: 'EMBER',
       amount: 400n,
       originatingService: 'market',
       actor: 'service:market',
@@ -447,7 +455,7 @@ test('a reservation cannot exceed what is available — "sold twice" is unrepres
   await post(depositEntry({ amount: 100n }))
   await reserve(
     deps(),
-    { subject: ALICE, assetCode: 'SHARD', amount: 100n, originatingService: 'market', actor: 'service:market', correlationId: 'c', idempotencyKey: freshKey() },
+    { subject: ALICE, assetCode: 'EMBER', amount: 100n, originatingService: 'market', actor: 'service:market', correlationId: 'c', idempotencyKey: freshKey() },
     requestFingerprint({ n: 1 }),
   )
   // The second listing cannot reserve, so it cannot be listed.
@@ -455,7 +463,7 @@ test('a reservation cannot exceed what is available — "sold twice" is unrepres
     () =>
       reserve(
         deps(),
-        { subject: ALICE, assetCode: 'SHARD', amount: 100n, originatingService: 'market', actor: 'service:market', correlationId: 'c', idempotencyKey: freshKey() },
+        { subject: ALICE, assetCode: 'EMBER', amount: 100n, originatingService: 'market', actor: 'service:market', correlationId: 'c', idempotencyKey: freshKey() },
         requestFingerprint({ n: 2 }),
       ),
     InsufficientFundsError,
@@ -467,7 +475,7 @@ test('releasing returns the value, and a second release is refused', { skip }, a
   await post(depositEntry({ amount: 1_000n }))
   const reservation = await reserve(
     deps(),
-    { subject: ALICE, assetCode: 'SHARD', amount: 400n, originatingService: 'market', actor: 'service:market', correlationId: 'c', idempotencyKey: freshKey() },
+    { subject: ALICE, assetCode: 'EMBER', amount: 400n, originatingService: 'market', actor: 'service:market', correlationId: 'c', idempotencyKey: freshKey() },
     requestFingerprint({ listing: 'l-1' }),
   )
 
@@ -515,7 +523,7 @@ test('the account key is unique: one subject+asset+purpose is one account', { sk
   await post(depositEntry({ amount: 100n }))
   await post(depositEntry({ amount: 200n }))
   const rows = await sql<{ n: number }[]>`
-    select count(*)::int as n from accounts where subject = ${ALICE} and asset_code = 'SHARD' and purpose = 'available'
+    select count(*)::int as n from accounts where subject = ${ALICE} and asset_code = 'EMBER' and purpose = 'available'
   `
   assert.equal(rows[0]!.n, 1, 'a second account for one key would split the balance in half')
   assert.equal(await balanceOf(ALICE), 300n)
@@ -547,8 +555,8 @@ test('a posting whose asset disagrees with its account is refused', { skip }, as
         correlationId: 'c',
         idempotencyKey: freshKey(),
         postings: [
-          // The account is a SHARD account; the posting claims EMBER.
-          { account: userAccount(ALICE, 'SHARD'), direction: 'debit', amount: 5n, assetCode: 'EMBER', sequence: 0 },
+          // The account is a BTC account; the posting claims EMBER.
+          { account: userAccount(ALICE, 'BTC'), direction: 'debit', amount: 5n, assetCode: 'EMBER', sequence: 0 },
           { account: custodyAccount('EMBER'), direction: 'credit', amount: 5n, assetCode: 'EMBER', sequence: 1 },
         ],
       }),
@@ -606,9 +614,9 @@ test('the trial balance reports per asset, and a fee entry still nets to zero', 
     correlationId: 'c-purchase',
     idempotencyKey: freshKey(),
     postings: [
-      { account: userAccount(ALICE), direction: 'debit', amount: 100n, assetCode: 'SHARD', sequence: 0 },
-      { account: userAccount(BOB), direction: 'credit', amount: 90n, assetCode: 'SHARD', sequence: 1 },
-      { account: platformFeeAccount(), direction: 'credit', amount: 10n, assetCode: 'SHARD', sequence: 2 },
+      { account: userAccount(ALICE), direction: 'debit', amount: 100n, assetCode: 'EMBER', sequence: 0 },
+      { account: userAccount(BOB), direction: 'credit', amount: 90n, assetCode: 'EMBER', sequence: 1 },
+      { account: platformFeeAccount(), direction: 'credit', amount: 10n, assetCode: 'EMBER', sequence: 2 },
     ],
   })
 
@@ -619,5 +627,210 @@ test('the trial balance reports per asset, and a fee entry still nets to zero', 
   const balance = await trialBalance(db())
   assert.equal(balance.balanced, true)
   assert.equal(balance.totalAbsoluteDelta, '0')
-  assert.equal(balance.assets.find((a) => a.assetCode === 'SHARD')!.delta, '0')
+  assert.equal(balance.assets.find((a) => a.assetCode === 'EMBER')!.delta, '0')
+})
+
+/* ================================================== INVARIANT: a retired asset may not be acquired */
+
+/**
+ * A SHARD holding, put there the way the live estate's 69 holders got theirs.
+ *
+ * `adjustment`, not `deposit_credited`: SHARD has no chain, so it can never have been deposited
+ * from one, and migration 13 says so. This is the setup for every case below — none of them mean
+ * anything unless there is real money in the asset being wound down.
+ */
+async function giveAliceShards(amount: bigint): Promise<void> {
+  await post(depositEntry({ amount, assetCode: 'SHARD', kind: 'adjustment' }))
+}
+
+test('THE GUARD: a purchase denominated in a retired asset is refused', { skip }, async () => {
+  await giveAliceShards(5_000n)
+
+  // This is `micro-mint`'s entry, verbatim in shape: the customer's Shards out, the platform's
+  // revenue in, kind 'purchase'. It posted successfully every day until migration 13, and the
+  // screen that said "Pay 2,500 Shards" was telling the truth about it.
+  await assert.rejects(
+    () =>
+      post({
+        kind: 'purchase',
+        originatingService: 'mint',
+        actor: 'system',
+        correlationId: 'c-mint',
+        idempotencyKey: freshKey(),
+        postings: [
+          { account: userAccount(ALICE, 'SHARD'), direction: 'debit', amount: 2_500n, assetCode: 'SHARD', sequence: 0 },
+          { account: platformFeeAccount('SHARD'), direction: 'credit', amount: 2_500n, assetCode: 'SHARD', sequence: 1 },
+        ],
+      }),
+    (err: unknown) =>
+      err instanceof RetiredAssetError && err.assetCode === 'SHARD' && err.kind === 'purchase',
+  )
+
+  // Refused means refused: no entry, and the holding is untouched.
+  assert.equal((await sql`select id from journal_entries where originating_service = 'mint'`).length, 0)
+  assert.equal(await balanceOf(ALICE, 'available', 'SHARD'), 5_000n)
+})
+
+test(
+  'THE GUARD: the DATABASE refuses it, with the application nowhere in the path',
+  { skip },
+  async () => {
+    // Raw SQL, deliberately, for the reason this file's header gives: a rule that only
+    // `validateEntryRequest` enforces is a rule the next service to post by another route has
+    // never heard of, and micro-mint reached these tables through an HTTP client that knew
+    // nothing about retirement.
+    const accounts = await sql<{ id: string }[]>`
+      insert into accounts (subject, type, asset_code, purpose) values
+        (${ALICE}, 'liability', 'SHARD', 'available'),
+        ('platform', 'revenue', 'SHARD', 'fees')
+      returning id
+    `
+    const entryId = uuidv7()
+
+    await assert.rejects(
+      () =>
+        sql.begin(async (tx) => {
+          await tx`
+            insert into journal_entries (id, kind, originating_service, actor, correlation_id, idempotency_key, occurred_at)
+            values (${entryId}, 'purchase', 'test', 'system', 'c', ${freshKey()}, now())
+          `
+          await tx`
+            insert into postings (entry_id, account_id, direction, amount, asset_code, sequence)
+            values (${entryId}, ${accounts[0]!.id}, 'debit', 2500, 'SHARD', 0)
+          `
+          return { value: null }
+        }),
+      /SHARD is retired and may not be acquired/,
+    )
+
+    assert.equal((await sql`select id from journal_entries where id = ${entryId}`).length, 0)
+  },
+)
+
+test('THE GUARD: a deposit of an asset with no chain behind it is refused', { skip }, async () => {
+  await assert.rejects(
+    () => post(depositEntry({ amount: 100n, assetCode: 'SHARD' })),
+    (err: unknown) => err instanceof RetiredAssetError && err.kind === 'deposit_credited',
+  )
+})
+
+test('the same purchase in a live asset still posts', { skip }, async () => {
+  // The guard must be about the ASSET and not about the kind. A suite that only proved the refusal
+  // would pass just as well over a rule that had broken every purchase in the estate.
+  await post(depositEntry({ amount: 5_000n }))
+  const outcome = await post({
+    kind: 'purchase',
+    originatingService: 'mint',
+    actor: 'system',
+    correlationId: 'c-mint-ember',
+    idempotencyKey: freshKey(),
+    postings: [
+      { account: userAccount(ALICE), direction: 'debit', amount: 2_500n, assetCode: 'EMBER', sequence: 0 },
+      { account: platformFeeAccount(), direction: 'credit', amount: 2_500n, assetCode: 'EMBER', sequence: 1 },
+    ],
+  })
+  assert.equal(outcome.result.postings.length, 2)
+  assert.equal(await balanceOf(ALICE), 2_500n)
+})
+
+/**
+ * **THE HALF THAT MATTERS MORE THAN THE REFUSAL.**
+ *
+ * 121 SHARD accounts exist in the live ledger, 69 of them holding a balance summing to 69,000
+ * units. A guard that stopped a holder withdrawing, transferring, converting or being refunded
+ * would strand every one of those units, and would be a worse defect than the pricing bug it was
+ * written to fix. So each of those routes is driven here, against real money in a retired asset,
+ * and each must still work.
+ */
+for (const route of [
+  { name: 'withdraw', kind: 'withdrawal_requested' as const },
+  { name: 'settle a withdrawal', kind: 'withdrawal_settled' as const },
+  { name: 'be refunded', kind: 'withdrawal_refunded' as const },
+  { name: 'transfer', kind: 'transfer' as const },
+  { name: 'convert out', kind: 'conversion' as const },
+  { name: 'have a wrong balance corrected', kind: 'reconciliation_correction' as const },
+]) {
+  test(`A HOLDER MAY STILL ${route.name.toUpperCase()} A RETIRED ASSET`, { skip }, async () => {
+    await giveAliceShards(5_000n)
+
+    await assert.doesNotReject(() =>
+      post({
+        kind: route.kind,
+        originatingService: 'wallet',
+        actor: 'system',
+        correlationId: `c-${route.kind}`,
+        idempotencyKey: freshKey(),
+        postings: [
+          { account: userAccount(ALICE, 'SHARD'), direction: 'debit', amount: 1_000n, assetCode: 'SHARD', sequence: 0 },
+          { account: custodyAccount('SHARD'), direction: 'credit', amount: 1_000n, assetCode: 'SHARD', sequence: 1 },
+        ],
+      }),
+    )
+
+    assert.equal(await balanceOf(ALICE, 'available', 'SHARD'), 4_000n)
+  })
+}
+
+test('a retired holding can be reversed, so a mistake in one stays fixable', { skip }, async () => {
+  await giveAliceShards(5_000n)
+  const spend = await post({
+    kind: 'transfer',
+    originatingService: 'wallet',
+    actor: 'system',
+    correlationId: 'c-oops',
+    idempotencyKey: freshKey(),
+    postings: [
+      { account: userAccount(ALICE, 'SHARD'), direction: 'debit', amount: 1_000n, assetCode: 'SHARD', sequence: 0 },
+      { account: userAccount(BOB, 'SHARD'), direction: 'credit', amount: 1_000n, assetCode: 'SHARD', sequence: 1 },
+    ],
+  })
+
+  await reverseEntryById(
+    deps(),
+    spend.result.id,
+    {
+      originatingService: 'ops',
+      actor: 'operator:1',
+      correlationId: 'c-fix',
+      idempotencyKey: freshKey(),
+    },
+    requestFingerprint({ reason: 'sent to the wrong subject' }),
+  )
+
+  assert.equal(await balanceOf(ALICE, 'available', 'SHARD'), 5_000n)
+  assert.equal(await balanceOf(BOB, 'available', 'SHARD'), 0n)
+})
+
+/**
+ * **The one copy this design could not avoid, kept honest by this test.**
+ *
+ * A trigger cannot import TypeScript, so `RETIRED_ASSETS` had to exist a second time as rows in
+ * `retired_assets` (migrations.ts, version 13) — the same trade migration 11 made for
+ * `chain_assets`, and kept honest the same way.
+ *
+ * If this fails, do NOT edit migration 13. `@cloudsforge/db` refuses a changed migration by
+ * checksum, and rightly. Add a new one that inserts the row, and every service in the estate is
+ * tightened by it at once with no code change anywhere.
+ */
+test('SCHEMA: retired_assets is exactly RETIRED_ASSETS, or the guard is aimed at nothing', { skip }, async () => {
+  const rows = await sql<{ asset_code: string }[]>`select asset_code from retired_assets order by asset_code`
+  assert.deepEqual(
+    rows.map((r) => r.asset_code),
+    [...RETIRED_ASSETS].sort(),
+    'contracts/packages/chain/src/index.ts and migration 13 disagree about which assets are wound down',
+  )
+  assert.ok(rows.length > 0, 'an empty table makes every refusal above unreachable')
+})
+
+test('SCHEMA: the retired set survives a caller trying to delete its way past the guard', { skip }, async () => {
+  // "Make the charge go through" is one DELETE away otherwise, and the row is the only thing
+  // between a wound-down unit and a customer's balance. The test harness owns these tables, so the
+  // REVOKE cannot bind it — the assertion is that the grant is absent for PUBLIC, which is what
+  // binds the service's own database role in every deployment.
+  const grants = await sql<{ privilege_type: string }[]>`
+    select privilege_type from information_schema.role_table_grants
+     where table_name = 'retired_assets' and grantee = 'PUBLIC'
+  `
+  const held = grants.map((g) => g.privilege_type)
+  assert.deepEqual(held, ['SELECT'], 'PUBLIC may do more than read the retired set')
 })

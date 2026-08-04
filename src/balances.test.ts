@@ -70,9 +70,9 @@ async function buildJournal(): Promise<void> {
     correlationId: 'c-purchase',
     idempotencyKey: freshKey(),
     postings: [
-      { account: userAccount(ALICE), direction: 'debit', amount: 1_000n, assetCode: 'SHARD', sequence: 0 },
-      { account: userAccount(BOB), direction: 'credit', amount: 950n, assetCode: 'SHARD', sequence: 1 },
-      { account: platformFeeAccount(), direction: 'credit', amount: 50n, assetCode: 'SHARD', sequence: 2 },
+      { account: userAccount(ALICE), direction: 'debit', amount: 1_000n, assetCode: 'EMBER', sequence: 0 },
+      { account: userAccount(BOB), direction: 'credit', amount: 950n, assetCode: 'EMBER', sequence: 1 },
+      { account: platformFeeAccount(), direction: 'credit', amount: 50n, assetCode: 'EMBER', sequence: 2 },
     ],
   })
 
@@ -83,8 +83,8 @@ async function buildJournal(): Promise<void> {
     correlationId: 'c-reserve',
     idempotencyKey: freshKey(),
     postings: [
-      { account: userAccount(ALICE), direction: 'debit', amount: 2_000n, assetCode: 'SHARD', sequence: 0 },
-      { account: userAccount(ALICE, 'SHARD', 'reserved'), direction: 'credit', amount: 2_000n, assetCode: 'SHARD', sequence: 1 },
+      { account: userAccount(ALICE), direction: 'debit', amount: 2_000n, assetCode: 'EMBER', sequence: 0 },
+      { account: userAccount(ALICE, 'EMBER', 'reserved'), direction: 'credit', amount: 2_000n, assetCode: 'EMBER', sequence: 1 },
     ],
   })
 
@@ -106,8 +106,8 @@ async function buildJournal(): Promise<void> {
     postings: [
       { account: userAccount(ALICE, 'EMBER'), direction: 'debit', amount: 1_000_000_000_000_000_000n, assetCode: 'EMBER', sequence: 0 },
       { account: custodyAccount('EMBER'), direction: 'credit', amount: 1_000_000_000_000_000_000n, assetCode: 'EMBER', sequence: 1 },
-      { account: custodyAccount('SHARD'), direction: 'debit', amount: 250n, assetCode: 'SHARD', sequence: 2 },
-      { account: userAccount(ALICE), direction: 'credit', amount: 250n, assetCode: 'SHARD', sequence: 3 },
+      { account: custodyAccount('EMBER'), direction: 'debit', amount: 250n, assetCode: 'EMBER', sequence: 2 },
+      { account: userAccount(ALICE), direction: 'credit', amount: 250n, assetCode: 'EMBER', sequence: 3 },
     ],
   })
 }
@@ -142,11 +142,11 @@ test('THE REPLAY: a corrupted projection is caught, and both numbers are reporte
   // journal says another. There is no legitimate way for this to happen, which is exactly why a
   // mismatch is a P0 rather than something to repair automatically.
   const account = await sql<{ id: string }[]>`
-    select id from accounts where subject = ${ALICE} and purpose = 'available' and asset_code = 'SHARD'
+    select id from accounts where subject = ${ALICE} and purpose = 'available' and asset_code = 'EMBER'
   `
   await sql`
     update balances set amount = amount + 1
-     where account_id = ${account[0]!.id} and asset_code = 'SHARD'
+     where account_id = ${account[0]!.id} and asset_code = 'EMBER'
   `
 
   const report = await rebuildBalances(db())
@@ -155,7 +155,7 @@ test('THE REPLAY: a corrupted projection is caught, and both numbers are reporte
 
   const mismatch = report.mismatches[0]!
   assert.equal(mismatch.accountId, account[0]!.id)
-  assert.equal(mismatch.assetCode, 'SHARD')
+  assert.equal(mismatch.assetCode, 'EMBER')
   assert.equal(mismatch.difference, '1', 'the projection claims one more than the journal')
   // Both sides are reported, because an operator needs to know which is which before deciding.
   assert.equal(BigInt(mismatch.projected) - BigInt(mismatch.replayed), 1n)
@@ -168,11 +168,11 @@ test('THE REPLAY: a projection row with no postings behind it is caught', { skip
   // never look at this row; the FULL OUTER JOIN is what finds it.
   const orphan = await sql<{ id: string }[]>`
     insert into accounts (subject, type, asset_code, purpose)
-    values ('user:99999999-9999-4999-8999-999999999999', 'liability', 'SHARD', 'available')
+    values ('user:99999999-9999-4999-8999-999999999999', 'liability', 'EMBER', 'available')
     returning id
   `
   await sql`
-    insert into balances (account_id, asset_code, amount) values (${orphan[0]!.id}, 'SHARD', 42)
+    insert into balances (account_id, asset_code, amount) values (${orphan[0]!.id}, 'EMBER', 42)
   `
 
   const report = await rebuildBalances(db())
@@ -203,12 +203,12 @@ test('the replay agrees with applyPosting computed independently in the test', {
   // Recompute one account's balance here, from the raw postings, using the same contract function.
   // If the replay had quietly re-expressed the sign convention in SQL, this is where it would show.
   const account = await sql<{ id: string; type: string }[]>`
-    select id, type from accounts where subject = ${ALICE} and purpose = 'available' and asset_code = 'SHARD'
+    select id, type from accounts where subject = ${ALICE} and purpose = 'available' and asset_code = 'EMBER'
   `
   const postings = await sql<{ direction: string; amount: string; sequence: number }[]>`
     select direction, amount::text as amount, sequence
       from postings
-     where account_id = ${account[0]!.id} and asset_code = 'SHARD'
+     where account_id = ${account[0]!.id} and asset_code = 'EMBER'
      order by entry_id, sequence
   `
 
@@ -220,14 +220,14 @@ test('the replay agrees with applyPosting computed independently in the test', {
         accountId: account[0]!.id,
         direction: row.direction === 'debit' ? 'debit' : 'credit',
         amount: BigInt(row.amount),
-        assetCode: 'SHARD',
+        assetCode: 'EMBER',
         sequence: row.sequence,
       },
       'liability',
     )
   }
 
-  assert.equal(balances.get(`${account[0]!.id}|SHARD`), expected)
+  assert.equal(balances.get(`${account[0]!.id}|EMBER`), expected)
   assert.ok(expected > 0n, 'the fixture should leave Alice with a positive balance')
 })
 

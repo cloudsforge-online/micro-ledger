@@ -84,21 +84,37 @@ export async function resetLedger(sql: postgres.Sql): Promise<void> {
 export const ALICE = 'user:11111111-1111-4111-8111-111111111111'
 export const BOB = 'user:22222222-2222-4222-8222-222222222222'
 
+/**
+ * The unit every fixture below is denominated in unless a test names another.
+ *
+ * **It was `SHARD`, and that was a defect in the suite itself.** Migration 13 refuses an
+ * acquisition denominated in a retired asset, and the moment it landed every one of these fixtures
+ * went red — because the canonical deposit in this file credits a user with a unit the estate
+ * stopped issuing on 2026-08-04. A suite whose default currency is a wound-down one cannot notice
+ * a service still charging in it; it is the same shape as `mint-web`'s `/Pay .* Shards/` button
+ * matcher, a test written forwards that pins the defect in place.
+ *
+ * `EMBER` is the live settlement asset. Tests that mean SHARD still say SHARD, and they must —
+ * `reconcile.test.ts` and `chainbacking.test.ts` depend on it being the one asset with no chain
+ * behind it, so `observed_source = 'liability_sum'` is legal for it and for nothing else.
+ */
+export const DEFAULT_TEST_ASSET: LedgerAssetCode = 'EMBER'
+
 /** The user's spendable liability account. A credit increases it; a debit spends it. */
 export function userAccount(
   subject: string,
-  assetCode: LedgerAssetCode = 'SHARD',
+  assetCode: LedgerAssetCode = DEFAULT_TEST_ASSET,
   purpose: AccountPurpose = 'available',
 ): NonNullable<PostingRequest['account']> {
   return { subject: subject as never, assetCode, purpose, type: 'liability' as AccountType }
 }
 
 /** What we hold on chain. A debit increases it — see `normalBalance`. */
-export function custodyAccount(assetCode: LedgerAssetCode = 'SHARD'): NonNullable<PostingRequest['account']> {
+export function custodyAccount(assetCode: LedgerAssetCode = DEFAULT_TEST_ASSET): NonNullable<PostingRequest['account']> {
   return { subject: 'custody', assetCode, purpose: 'treasury', type: 'asset' as AccountType }
 }
 
-export function platformFeeAccount(assetCode: LedgerAssetCode = 'SHARD'): NonNullable<PostingRequest['account']> {
+export function platformFeeAccount(assetCode: LedgerAssetCode = DEFAULT_TEST_ASSET): NonNullable<PostingRequest['account']> {
   return { subject: 'platform', assetCode, purpose: 'fees', type: 'revenue' as AccountType }
 }
 
@@ -128,7 +144,7 @@ export function depositEntry(options: {
   originatingService?: string
   kind?: PostEntryRequest['kind']
 }): PostEntryRequest {
-  const assetCode = options.assetCode ?? 'SHARD'
+  const assetCode = options.assetCode ?? DEFAULT_TEST_ASSET
   const subject = options.subject ?? ALICE
   return {
     kind: options.kind ?? 'deposit_credited',
@@ -163,7 +179,7 @@ export function withdrawalEntry(options: {
   idempotencyKey?: string
   kind?: PostEntryRequest['kind']
 }): PostEntryRequest {
-  const assetCode = options.assetCode ?? 'SHARD'
+  const assetCode = options.assetCode ?? DEFAULT_TEST_ASSET
   const subject = options.subject ?? ALICE
   return {
     kind: options.kind ?? 'withdrawal_requested',

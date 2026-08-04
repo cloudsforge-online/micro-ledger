@@ -96,7 +96,7 @@ const posting = (direction: 'debit' | 'credit', amount: bigint, sequence: number
   accountId: '11111111-1111-4111-8111-111111111111',
   direction,
   amount,
-  assetCode: 'SHARD' as const,
+  assetCode: 'EMBER' as const,
   sequence,
 })
 
@@ -117,7 +117,7 @@ test('an unbalanced entry is refused with the asset and the difference named', (
   assert.throws(
     () => validateEntryRequest(entry([posting('debit', 100n, 0), posting('credit', 99n, 1)])),
     (err: unknown) =>
-      err instanceof LedgerValidationError && err.problems.some((p) => /SHARD is out by 1/.test(p)),
+      err instanceof LedgerValidationError && err.problems.some((p) => /EMBER is out by 1/.test(p)),
   )
 })
 
@@ -141,7 +141,7 @@ test('a posting that names no account is refused before any query runs', () => {
     () =>
       validateEntryRequest({
         ...entry([]),
-        postings: [{ direction: 'debit', amount: 1n, assetCode: 'SHARD', sequence: 0 }],
+        postings: [{ direction: 'debit', amount: 1n, assetCode: 'EMBER', sequence: 0 }],
       }),
     /names no account/,
   )
@@ -182,7 +182,7 @@ test('the correlation id falls back to the request id rather than being absent',
       originatingService: 'wallet',
       actor: 'system',
       idempotencyKey: 'k1',
-      postings: [{ accountId: '11111111-1111-4111-8111-111111111111', direction: 'debit', amount: '1', assetCode: 'SHARD', sequence: 0 }],
+      postings: [{ accountId: '11111111-1111-4111-8111-111111111111', direction: 'debit', amount: '1', assetCode: 'EMBER', sequence: 0 }],
     },
     'req-abc',
   )

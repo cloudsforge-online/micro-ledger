@@ -68,7 +68,7 @@ function rng(seed: number): () => number {
   }
 }
 
-const ASSETS: LedgerAssetCode[] = ['SHARD', 'EMBER']
+const ASSETS: LedgerAssetCode[] = ['BTC', 'EMBER']
 const USERS = [
   'user:aaaaaaaa-0000-4000-8000-000000000001',
   'user:aaaaaaaa-0000-4000-8000-000000000002',
