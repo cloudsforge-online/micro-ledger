@@ -222,7 +222,7 @@ test-only knob. A known placeholder value is refused at boot rather than accepte
 | `LEDGER_DATABASE_POOL_MAX` | `10` | integer 1–500; too low serialises postings, too high exhausts Postgres connections (`src/env.ts:187`) |
 | `IDENTITY_JWKS_URL` | — | **required**. Unreachable at runtime → every domain route answers 503, not 401 (`src/env.ts:188`, `src/server.ts:268`) |
 | `IDENTITY_ISSUER` | — | **required**. Wrong value → every token fails verification and the whole surface is 401 (`src/env.ts:189`) |
-| `OUTBOX_SIGNING_SECRET` | — | **required**, ≥24 chars, placeholders refused. Wrong → subscribers cannot verify an event came from us; changing it invalidates in-flight signatures (`src/env.ts:190`) |
+| `OUTBOX_SIGNING_SECRET` | — | **required**, and held to a SHAPE rather than to a deny-list: base64 or hex, at least 32 decoded **bytes**, and a measured Shannon entropy floor (`assertGeneratedSecret` in `@cloudsforge/secrets`, called from `requiredSigningSecret` in `src/env.ts`). `openssl rand -base64 48`. There is no `NODE_ENV` exemption and no escape hatch — CI generates a real value per run rather than being let through. Wrong → subscribers cannot verify an event came from us; changing it invalidates in-flight signatures |
 | `INSTANCE_ID` | hostname | names this replica in `jobs.locked_by`; wrong only makes a stuck lease harder to attribute (`src/env.ts:191`) |
 | `LEDGER_ASSET_TOLERANCE` | `{}` | JSON of asset → smallest-unit string. **An asset absent from the map gets zero tolerance, not infinity** — `withinTolerance` fails closed and this parser must not undo that (`parseAssetTolerance` in `src/env.ts`, reasoning in the doc comment above it). Set too high and drift stops freezing withdrawals. `.env.example` states **`"LTC":"0"`** explicitly: LTC is a UTXO chain of 8 decimals, both sides of the comparison are exact integers, so there is no scale gap for a tolerance to absorb and any drift is real. Zero is what absence already means — it is written down so an operator can tell *decided* from *forgotten*. An empty string is **refused**, not read as zero, because `BigInt('') === 0n` would otherwise forge that same signal |
 | `LEDGER_RECONCILE_ASSETS` | `SHARD,EMBER` | the list actually swept. An asset omitted here is **never reconciled** — explicit rather than derived from `accounts` so an operator can read the list without inferring it from data. **The default includes EMBER, and EMBER fails every run and freezes withdrawals until `micro-indexer` supplies an aggregate**: it is in `ON_CHAIN_ASSETS`, Hearth's mainnet has not launched, and an asset nobody can observe is one nobody should be able to withdraw. Removing it here is the *only* supported exemption, because it makes the asset stop being checked rather than making it look checked (`src/env.ts`, argument on `Env.reconcileAssets`) |
@@ -422,19 +422,20 @@ where the first token had already been refused with a real 401 by the real index
 * **No OpenAPI description.** 11-data-and-contract-strategy.md:288 names one as the mechanism for
   generating the SDK; no artefact exists anywhere in the estate, so `@cloudsforge/sdk` is
   hand-written against verified route tables instead (§3.3d, item 1).
-* **`.env.example` and `src/env.ts` disagree on the secret length.** The file says
-  `OUTBOX_SIGNING_SECRET` must be "at least 32 random characters" (`.env.example:19`);
-  `requiredSecret` is called with no length override, so the enforced minimum is the default **24**
-  (`src/env.ts:190`, default at `:55`). The comment is the stricter of the two, so nothing insecure
-  follows — but a 26-character secret satisfies the code and contradicts the file. Found while
-  writing this and **reported rather than edited**, since the remit of that change was this README.
-  `micro-billing`'s `.env.example` carries the identical wording and the identical mismatch.
-* **The example secret would boot.** `OUTBOX_SIGNING_SECRET=CHANGE_ME_TO_32_RANDOM_CHARACTERS`
-  (`.env.example:21`) is 33 characters and is **not** in the `PLACEHOLDERS` set
-  (`src/env.ts:36-45`), so a deployment that copies `.env.example` unchanged starts successfully
-  with a signing secret that is in the repository. The guard catches `changeme` and `change-me` but
-  not this spelling. `micro-indexer` and `micro-mint` ship the variable **empty**, which fails
-  closed and is the better pattern.
+* ~~**`.env.example` and `src/env.ts` disagree on the secret length.**~~ **Fixed** — and the
+  disagreement turned out to be the smaller half of it. Both numbers counted KEYSTROKES, and
+  keystrokes are not the unit: 32 characters of prose is not 32 bytes of key. The floor is now 32
+  decoded bytes plus a measured entropy floor, and the file and the code state the same rule
+  because they both name one command (micro-org #142).
+* ~~**The example secret would boot.**~~ **Fixed**, and this entry was the whole of micro-org #142
+  in miniature: a 33-character value not on a deny-list of eight exact strings, waved through by
+  the guard whose entire job was to stop it. The estate had the same defect at scale — the shared
+  event-bus HMAC key was `estate-only-outbox-secret-00000000000000` on 54 lines of a PUBLIC compose
+  file, 40 characters, on nobody's list, so no check in any of 25 services could have failed. A
+  deny-list of exact strings cannot work, because the next placeholder somebody writes is by
+  definition not on it. `assertGeneratedSecret` asserts the shape a placeholder cannot have
+  instead, and the example now refuses to boot because it contains a hyphen — the one thing every
+  placeholder this estate ever wrote had in common.
 * **`BASELINE_VERSION = 0`** (`src/migrations.ts:631`): there is nothing to adopt. Moving value out
   of `forge-pay`'s single-sided `ledger` is a data migration with its own opening-balance entries,
   not a schema baseline, and it has not been written.
