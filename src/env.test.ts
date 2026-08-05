@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
 
 /**
  * A valid environment, applied to the process before `./env.ts` is imported.
@@ -14,7 +15,10 @@ const VALID: Record<string, string> = {
   LEDGER_DATABASE_URL: 'postgres://ledger:pw@127.0.0.1:5432/ledger',
   IDENTITY_JWKS_URL: 'http://identity.test/.well-known/jwks.json',
   IDENTITY_ISSUER: 'http://identity.test',
-  OUTBOX_SIGNING_SECRET: 'K2sN4vQ8xR1wB6tY9zL3mF7hC5jD0pA4',
+  // GENERATED, not written. `assertGeneratedSecret` refuses a typed value, and a fixture
+  // exempt from the rule it is meant to exercise is how the placeholder in micro-org #142
+  // survived every test in the estate.
+  OUTBOX_SIGNING_SECRET: randomBytes(48).toString('base64'),
 }
 for (const [key, value] of Object.entries(VALID)) process.env[key] = value
 
@@ -38,7 +42,38 @@ test('a missing variable names itself', () => {
 
 test('a placeholder secret is refused outright', () => {
   assert.throws(() => loadEnv({ ...BASE, OUTBOX_SIGNING_SECRET: 'changeme' }), /known placeholder/)
-  assert.throws(() => loadEnv({ ...BASE, OUTBOX_SIGNING_SECRET: 'short' }), /at least 24 characters/)
+  assert.throws(() => loadEnv({ ...BASE, OUTBOX_SIGNING_SECRET: 'short' }), /3 bytes of key material/)
+})
+
+test('THE VALUE THAT SAT IN A PUBLIC REPOSITORY IS REFUSED, and every near miss with it', () => {
+  // micro-org #142. Each of these cleared the old guard — a deny-list of exact strings plus a
+  // 24-character floor — and each is a real string that was deployed or set in CI, not an invented
+  // one. If a future edit weakens the floor, it fails against evidence rather than against taste.
+  for (const value of [
+    'estate-only-outbox-secret-00000000000000', // 54 lines of a PUBLIC compose file, 40 chars
+    'ci-only-not-a-real-secret-000000000000', // 23 CI workflows
+    'K2sN4vQ8xR1wB6tY9zL3mF7hC5jD0pA4', // this file's own former fixture: 32 chars, 24 bytes
+    '0'.repeat(64), // right alphabet, right length, no entropy
+  ]) {
+    assert.throws(
+      () => loadEnv({ ...BASE, OUTBOX_SIGNING_SECRET: value }),
+      (err: unknown) => {
+        // The refusal must not echo the value: the reason this guard exists is that the value was
+        // readable, and a message carrying it moves the secret to the log collector.
+        const message = (err as Error).message
+        assert.ok(!message.includes(value), 'the refusal echoed the value')
+        assert.match(message, /OUTBOX_SIGNING_SECRET/)
+        assert.match(message, /openssl rand -base64 48/)
+        return true
+      },
+    )
+  }
+})
+
+test('what the estate is actually running is accepted', () => {
+  // Measured on both networks 2026-08-05: 64 characters, base64, 48 bytes, 5.27 bits per character.
+  assert.doesNotThrow(() => loadEnv({ ...BASE, OUTBOX_SIGNING_SECRET: randomBytes(48).toString('base64') }))
+  assert.doesNotThrow(() => loadEnv({ ...BASE, OUTBOX_SIGNING_SECRET: randomBytes(32).toString('hex') }))
 })
 
 test('THE SAFETY PROPERTY: an absent tolerance map means ZERO tolerance, not unlimited', () => {

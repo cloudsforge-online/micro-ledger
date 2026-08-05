@@ -27,12 +27,14 @@ jobs:
       # The image startup smoke test boots the real service, and `env.ts` validates its
       # configuration at import — so the container needs the variables it declares, not just a
       # database, or it exits before it serves /livez. These are CI-only NON-secrets: throwaway
-      # values that only have to clear a length check, and URLs that are never dialled because
-      # /livez needs no upstream. Never a real credential.
+      # values, and URLs that are never dialled because /livez needs no upstream. Never a real
+      # credential. `@generate` asks service-ci.yml for a fresh `openssl rand -base64 48` per
+      # run: the boot guard has no CI exemption, so CI holds a real secret rather than a
+      # string claiming to be one (micro-org #142).
       smoke-env: |
         IDENTITY_JWKS_URL=http://127.0.0.1:4001/.well-known/jwks.json
         IDENTITY_ISSUER=http://127.0.0.1:4001
-        OUTBOX_SIGNING_SECRET=ci-only-not-a-real-secret-000000000000
+        OUTBOX_SIGNING_SECRET=@generate
     secrets:
       # @cloudsforge/* is resolved by link:../runtime and link:../contracts, so CI checks out
       # micro-runtime and micro-contracts as siblings — both private, so the workflow needs a
