@@ -1,5 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 
 /**
  * A valid environment, applied to the process before `./env.ts` is imported.
@@ -45,6 +46,40 @@ test('THE SAFETY PROPERTY: an absent tolerance map means ZERO tolerance, not unl
   // parser must not undo that by inventing a default. An asset silently exempt from the only check
   // that guards it is worse than one that alerts too often.
   assert.deepEqual(loadEnv(BASE).assetTolerance, {})
+})
+
+test('LTC IS AT ZERO TOLERANCE, stated rather than omitted — a satoshi of drift freezes it', () => {
+  // Zero and absent are the same BEHAVIOUR, which is exactly why this needs a test: nothing else
+  // in the suite could tell a deliberate zero apart from a forgotten entry, and the two are very
+  // different facts about whether anybody thought about Litecoin.
+  //
+  // The argument for zero is that there is no scale gap to absorb. LTC is a UTXO chain of 8
+  // decimals: the indexer sums integer outputs, the ledger sums integer postings, neither rounds.
+  // EMBER's non-zero bound exists because 18 decimals and fees in flight genuinely do not agree to
+  // the last unit; copying that reasoning across to an 8-decimal UTXO chain would be the "reuse
+  // the number with the code" mistake contracts-chain raises about Litecoin's confirmation depth.
+  const parsed = parseAssetTolerance('{"EMBER":"1000000000000000","LTC":"0"}')
+  assert.equal(parsed['LTC'], 0n)
+  assert.equal(parsed['EMBER'], 1_000_000_000_000_000n)
+
+  // `BigInt('') === 0n`, so an empty string would parse as a zero tolerance that nobody typed.
+  // It reads identically in a deploy manifest and it must not be accepted as one.
+  assert.throws(() => parseAssetTolerance('{"LTC":""}'), /not an integer/)
+
+  // And the freeze this buys: one smallest unit of drift is already outside the bound.
+  const bound = parsed['LTC'] ?? 0n
+  assert.ok(1n > bound, 'a one-satoshi Litecoin drift must not be within tolerance')
+})
+
+test('the shipped example config parses, and says something about every asset it names', () => {
+  // `.env.example` is the file an operator copies. A tolerance map that does not parse there is a
+  // service that will not boot, discovered by the operator rather than by this suite.
+  const shipped = readFileSync(new URL('../.env.example', import.meta.url), 'utf8')
+  const line = /^LEDGER_ASSET_TOLERANCE=(.+)$/m.exec(shipped)?.[1]
+  assert.ok(line, '.env.example no longer sets LEDGER_ASSET_TOLERANCE')
+  const parsed = parseAssetTolerance(line)
+  assert.equal(parsed['LTC'], 0n, '.env.example stopped stating LTC, which is how a zero becomes a shrug')
+  assert.ok((parsed['EMBER'] ?? 0n) > 0n)
 })
 
 test('tolerances are parsed as bigint, so an 18-decimal bound is not rounded', () => {

@@ -998,6 +998,65 @@ export const MIGRATIONS: readonly Migration[] = [
         for each row execute function ledger_refuse_retired_acquisition();
     `,
   },
+
+  {
+    version: 14,
+    name: 'litecoin_chain_asset',
+    up: `
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+      -- LITECOIN IS SETTLED ON A CHAIN, SO IT MAY NOT BE ATTESTED BY THIS LEDGER'S OWN BOOKS.
+      --
+      -- One row. It is a whole migration because migration 11 said it would have to be, and it was
+      -- right: the text of an applied migration is CHECKSUMMED (@cloudsforge/db, checksumOf), so
+      -- adding 'LTC' to the insert up there would change a checksum that every deployment has
+      -- already recorded, and every deployment would then refuse to start. "A new chain asset is a
+      -- new migration inserting a row, which is exactly right: it is a schema event, and it should
+      -- leave a version behind." This is that version.
+      --
+      -- ── WHAT THIS ROW ACTUALLY TURNS ON ──────────────────────────────────────────────────────
+      --
+      -- Not documentation. 'chain_assets' is read by the INVARIANT 6 trigger (migration 11), and
+      -- membership is what makes these two things true of LTC where they were not before:
+      --
+      --   1. observed_source = 'liability_sum' becomes ILLEGAL for it. Until this row existed, a
+      --      Litecoin reconciliation could compare this ledger's custody accounts against this
+      --      ledger's liability accounts and report 'clean' — the vacuous answer, about a chain it
+      --      had never looked at. 'clean' is also the status that LIFTS a withdrawal freeze.
+      --      'reconcile.test.ts' iterates ON_CHAIN_ASSETS and asserts the refusal for every member,
+      --      so this was RED between the contracts release and this migration, which is the correct
+      --      way round: the guard failing open is what a test must never let pass quietly.
+      --   2. A run with no observation must record 'unavailable', a NULL total, a NULL drift and
+      --      status 'failed' — it may not launder an absence into a zero.
+      --
+      -- ── WHY THIS IS SAFE TO APPLY TO THE LIVE ESTATE, CHECKED RATHER THAN ASSUMED ────────────
+      --
+      -- Membership here does not by itself cause a single reconciliation run. WHICH assets are
+      -- swept is 'LEDGER_RECONCILE_ASSETS', which the estate sets explicitly to "SHARD,EMBER"
+      -- (deploy/compose/docker-compose.estate.yml). BTC, ETH, SOL and XRP have sat in this table
+      -- since migration 11 without ever being swept, and LTC joins them on exactly that footing.
+      -- So this row cannot freeze anything today; it makes the freeze CORRECT on the day Litecoin
+      -- is swept, which is the only day it could matter.
+      --
+      -- The insert is 'on conflict do nothing' for the same reason migration 11's is: a migration
+      -- must be safe to re-run against a database that has somehow already got the row, and a
+      -- duplicate-key error in a schema migration is an outage rather than a warning.
+      --
+      -- LTC's tolerance is deliberately NOT set here and belongs in 'LEDGER_ASSET_TOLERANCE'.
+      -- Zero is the right bound for it and the reasoning is in 'env.ts' beside that variable: a
+      -- UTXO chain's totals are exact integers on both sides, so any drift at all is a real one.
+      -- Zero is also what an ABSENT entry already means — 'withinTolerance' fails closed — so the
+      -- correct action is to state it rather than to change it.
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+
+      insert into chain_assets (asset_code, note) values
+        ('LTC',
+         'Litecoin. Bitcoin family in contracts-chain, so micro-indexer follows it with the ' ||
+         'bitcoin worker and its reorg handling, unchanged. Confirmations are 12 and not ' ||
+         'Bitcoin''s 6: ~2.5-minute blocks on a fraction of Bitcoin''s hashrate. Added by ' ||
+         'migration 14 rather than by editing 11, whose text is checksummed.')
+      on conflict (asset_code) do nothing;
+    `,
+  },
 ]
 
 /**

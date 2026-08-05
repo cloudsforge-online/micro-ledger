@@ -124,6 +124,30 @@ function integer(source: Source, name: string, fallback: number, min: number, ma
  * Parsed as strings and converted with `BigInt`, never `Number`: a tolerance for an 18-decimal
  * asset routinely exceeds `Number.MAX_SAFE_INTEGER`, and a float here would round the bound that
  * decides whether withdrawals freeze.
+ *
+ * ── WHY A TOLERANCE IS EVER NON-ZERO, AND WHY LTC'S IS ZERO ────────────────────────────────────
+ *
+ * A tolerance is not a comfort margin. It exists for one thing: the places where the chain's total
+ * and the ledger's sum are computed at different scales and cannot be expected to agree to the
+ * last unit. `.env.example` sets EMBER to 1000000000000000 — 0.001 EMBER of 18 decimals — for
+ * exactly that reason, and it is the only entry there.
+ *
+ * **Litecoin's is zero, and that is a decision rather than an omission.** LTC is a UTXO chain of 8
+ * decimals: the indexer's custody total is a sum of integer satoshi-denominated outputs, and this
+ * ledger's position is a sum of integer postings. Neither side rounds, so there is no scale gap
+ * for a tolerance to absorb, and any non-zero drift is a real discrepancy about real coin. BTC has
+ * had no entry since this file was written, for the same reason and with the same effect.
+ *
+ * The consequence is worth stating plainly, because it is the point: a one-satoshi Litecoin drift
+ * FREEZES LTC WITHDRAWALS. That is the correct response to a custodian that cannot account for a
+ * unit of somebody's money, and the wrong instinct — "set it to something small so it stops
+ * paging" — is how an asset ends up exempt from the only check that guards it while continuing to
+ * look checked.
+ *
+ * Zero is what an absent entry already means, so stating it changes no behaviour. It is stated in
+ * `.env.example` anyway, because an operator reading that file should see which assets were
+ * considered and what was chosen for each. An absence cannot distinguish "decided" from
+ * "forgotten", and this estate has been bitten by that distinction more than once.
  */
 export function parseAssetTolerance(raw: string): AssetTolerance {
   let parsed: unknown
@@ -139,6 +163,15 @@ export function parseAssetTolerance(raw: string): AssetTolerance {
   for (const [asset, value] of Object.entries(parsed as Record<string, unknown>)) {
     if (typeof value !== 'string' && typeof value !== 'number') {
       throw new EnvError(`LEDGER_ASSET_TOLERANCE.${asset} must be a decimal string`)
+    }
+    // **`BigInt('') === 0n`, and so does `BigInt('   ')`.** Without this line an empty string is
+    // accepted as a tolerance of zero — a bound nobody typed, indistinguishable afterwards from a
+    // considered one. It fails CLOSED, so it is not a money leak; it is worse in a subtler way,
+    // because the estate is now deliberately writing `"LTC":"0"` to mean "we thought about this
+    // and chose zero", and a silent empty string would forge exactly that signal. An operator who
+    // half-filled a deploy manifest must be told, not quietly agreed with.
+    if (typeof value === 'string' && !/^-?\d+$/.test(value.trim())) {
+      throw new EnvError(`LEDGER_ASSET_TOLERANCE.${asset} is not an integer: ${String(value)}`)
     }
     let amount: bigint
     try {

@@ -47,6 +47,89 @@ test('checksums are stable, which is what makes an edited migration refuse to ru
   }
 })
 
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * THE CHECKSUM LOCK — editing an applied migration is caught HERE, not by a failed deployment.
+ *
+ * Two files in this repository tell a reader not to edit a migration that has shipped.
+ * `reconcile.test.ts` says it in the message on the `chain_assets` assertion: "If this fails, do
+ * NOT edit migration 11 — `@cloudsforge/db` refuses a changed migration by checksum, and rightly.
+ * Add a new one." Migration 11's own text says the same at length.
+ *
+ * **Both were prose, and prose does not fail a build.** Adding `('LTC', …)` to migration 11's
+ * insert — the obvious, wrong, one-line way to do what migration 14 does — passed every test in
+ * this repository. It would have been caught by `@cloudsforge/db` refusing to start, in the
+ * migrator container, on the deploy, against the live estate's schema, taking every ledger replica
+ * that waits on it down with it. That is the most expensive possible place to learn it.
+ *
+ * So the checksums of migrations that have been applied are written down. A change to the TEXT of
+ * any of them fails here, in a second, on a branch.
+ *
+ * ── HOW TO ADD A MIGRATION (this test does not obstruct that) ─────────────────────────────────
+ *
+ * Append it to `MIGRATIONS` and add its version and checksum below. That is the whole procedure,
+ * and it is deliberately a two-line diff rather than an automatic one: a mechanism that re-recorded
+ * these itself would agree with whatever it was given and check nothing.
+ *
+ * ── HOW TO CHANGE AN APPLIED ONE ─────────────────────────────────────────────────────────────
+ *
+ * You cannot. That is the point. Write a new migration that alters what the old one created.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+const APPLIED_CHECKSUMS: Readonly<Record<number, string>> = Object.freeze({
+  1: 'eb9bd289',
+  2: '2479dd84',
+  3: '8b24c44e',
+  4: '693798d7',
+  5: '5800efa4',
+  6: '278ec770',
+  7: '02833933',
+  8: 'c67de1c5',
+  9: '99880cfb',
+  10: 'c165a0ef',
+  11: '2b3e9b64',
+  12: '37b85469',
+  13: 'f17ce678',
+  14: 'e2aee319',
+})
+
+test('AN APPLIED MIGRATION IS IMMUTABLE, and this is where editing one is caught', () => {
+  for (const m of MIGRATIONS) {
+    const expected = APPLIED_CHECKSUMS[m.version]
+    assert.ok(
+      expected,
+      `migration ${m.version} (${m.name}) has no recorded checksum. If it is NEW, add ` +
+        `${m.version}: '${checksumOf(m)}' to APPLIED_CHECKSUMS above.`,
+    )
+    assert.equal(
+      checksumOf(m),
+      expected,
+      `migration ${m.version} (${m.name}) HAS BEEN EDITED. Its text has already been applied and ` +
+        'recorded in every environment, so @cloudsforge/db will refuse to start against it. Revert ' +
+        'the edit and write a new migration that alters what this one created.',
+    )
+  }
+  // Both directions: a deleted migration is as bad as an edited one, and leaves a gap in the
+  // version sequence that a fresh database would apply differently from an existing one.
+  assert.equal(
+    MIGRATIONS.length,
+    Object.keys(APPLIED_CHECKSUMS).length,
+    'a migration was removed, or one was added without recording its checksum',
+  )
+})
+
+test('migration 11 in particular still says exactly what it said, LTC having gone in via 14', () => {
+  // Named on its own because it is the one this release was most tempted to edit: `chain_assets` is
+  // seeded there, `reconcile.test.ts` asserts that table equals ON_CHAIN_ASSETS, and adding a row
+  // to the existing insert is a one-character-per-asset change that looks completely reasonable.
+  const eleven = MIGRATIONS.find((m) => m.version === 11)
+  const fourteen = MIGRATIONS.find((m) => m.version === 14)
+  assert.ok(eleven && fourteen)
+  assert.doesNotMatch(eleven.up, /'LTC'/, 'LTC was added to migration 11 instead of to a new one')
+  assert.match(fourteen.up, /insert into chain_assets[\s\S]*?'LTC'/)
+  assert.match(fourteen.up, /on conflict \(asset_code\) do nothing/)
+})
+
 test('every table the service reads or writes is created', () => {
   for (const table of [
     'jobs',
