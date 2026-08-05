@@ -17,7 +17,12 @@
 
 import { hostname } from 'node:os'
 import type { AssetTolerance, LedgerAssetCode } from '@cloudsforge/contracts-money'
-import { assertGeneratedSecret } from '@cloudsforge/secrets'
+import {
+  MIN_ENTROPY_BASE64,
+  MIN_SECRET_BYTES,
+  assertGeneratedSecret,
+  entropyPerChar,
+} from '@cloudsforge/secrets'
 
 /**
  * The service's own name. A constant rather than a variable: it is a property of the repository,
@@ -34,17 +39,6 @@ export class EnvError extends Error {
   }
 }
 
-const PLACEHOLDERS = new Set([
-  'changeme',
-  'change-me',
-  'placeholder',
-  'secret',
-  'dev-secret',
-  'dev-outbox-signing-secret',
-  'replace-with-a-real-secret',
-  'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-])
-
 type Source = Readonly<Record<string, string | undefined>>
 
 function required(source: Source, name: string): string {
@@ -53,24 +47,91 @@ function required(source: Source, name: string): string {
   return value
 }
 
-function requiredSecret(source: Source, name: string, minLength = 24): string {
-  const value = required(source, name)
-  if (PLACEHOLDERS.has(value.toLowerCase())) {
-    throw new EnvError(`${name} is set to a known placeholder — generate a real secret`)
+/** `cfsc_` then base64url. Identity mints the body with `-` and `_` in the alphabet. */
+const SERVICE_CREDENTIAL = /^cfsc_([A-Za-z0-9_-]+)$/
+
+/**
+ * A service credential, held to its SHAPE — the same discipline as `requiredSigningSecret`, and
+ * emphatically not the same rule.
+ *
+ * This replaces a `PLACEHOLDERS` set of eight exact strings. That set could not fail for the reason
+ * micro-org#142 records: the placeholder that reached 44 containers on both networks was 40
+ * characters, cleared every length gate, and was not one of the eight. A membership test only ever
+ * catches a string somebody already thought of, and the next placeholder is by definition not on it.
+ *
+ * ── WHY `assertGeneratedSecret` IS NOT THE GUARD HERE ──────────────────────────────────────────
+ *
+ * It would refuse every credential this estate has ever minted, on both networks, and ledger would
+ * exit 1 at boot. It requires the value to be wholly base64 or wholly hex; `cfsc_…` is neither,
+ * because of the underscore in its own prefix.
+ *
+ * The second half is subtler and is why this was measured on the live containers rather than
+ * reasoned about. The credential BODY is base64**url**, so it may contain `-` and `_`:
+ *
+ *     mainnet  cfsc_ + 43 chars, alphanumeric only,     entropy 4.85 bits/char
+ *     testnet  cfsc_ + 43 chars, CONTAINS A HYPHEN,     entropy 4.87 bits/char
+ *
+ * A guard that refuses hyphens — which is exactly what a copy of custody's `assertMasterSecret`
+ * does, and every placeholder this estate wrote had one — would have booted mainnet and killed
+ * testnet. One environment healthy, one dead, from one rule that looked right in review.
+ *
+ * ── WHAT IT ASSERTS ────────────────────────────────────────────────────────────────────────────
+ *
+ * The prefix does most of the work and is not cosmetic: identity issues credentials with it, and
+ * `assertGeneratedSecret`'s markers are irrelevant against a value nobody types. It refuses
+ * `changeme`, it refuses the 40-character estate placeholder, and it refuses a JWT — which is the
+ * ten-minute cliff wearing the fix's clothes and the whole of micro-org#197.
+ *
+ * The byte floor and the entropy floor are imported rather than restated, so this file cannot drift
+ * from the one that guards the signing key.
+ *
+ * NO MESSAGE BELOW CONTAINS THE VALUE. Lengths and measurements only, and each names the variable
+ * and how to get a real one — a refusal an operator cannot act on is an outage, not a control.
+ */
+function assertServiceCredential(name: string, value: string): void {
+  const fix = `mint one with: deploy/scripts/estate-bootstrap.sh`
+
+  if (/^ey[A-Za-z0-9_-]*\./.test(value)) {
+    throw new EnvError(
+      `${name} carries a TOKEN, not a credential — a JWT is minted with a ten-minute life and is ` +
+        `dead ten minutes after the boot that read it (micro-org#197). ${fix}`,
+    )
   }
-  // Length is a proxy for entropy and the only one available here. It is set above the point at
-  // which a human-chosen string is plausible, so a memorable password fails this check too.
-  if (value.length < minLength) {
-    throw new EnvError(`${name} must be at least ${minLength} characters (got ${value.length})`)
+
+  const match = SERVICE_CREDENTIAL.exec(value)
+  if (!match) {
+    throw new EnvError(
+      `${name} is not a service credential — identity mints these with a 'cfsc_' prefix, and a ` +
+        `credential is generated rather than typed. ${fix}`,
+    )
   }
-  return value
+
+  const body = match[1] ?? ''
+  // BYTES of key material, not keystrokes. base64url carries 6 bits per character, and the unit a
+  // 24-character minimum was reaching for was never characters.
+  const bytes = Math.floor((body.length * 6) / 8)
+  if (bytes < MIN_SECRET_BYTES) {
+    throw new EnvError(
+      `${name} carries ${bytes} bytes of key material and at least ${MIN_SECRET_BYTES} are ` +
+        `required — length in CHARACTERS is not the unit that matters. ${fix}`,
+    )
+  }
+
+  const measured = entropyPerChar(body)
+  if (measured < MIN_ENTROPY_BASE64) {
+    throw new EnvError(
+      `${name} is long enough but its entropy is ${measured.toFixed(2)} bits per character, below ` +
+        `the ${MIN_ENTROPY_BASE64} floor — a repeated pattern is not a key. ${fix}`,
+    )
+  }
 }
 
 /**
  * The estate's shared event-bus HMAC key, held to a shape rather than to a deny-list.
  *
- * `requiredSecret` above cannot be the guard for this one. It refuses a fixed list of exact
- * strings and anything under 24 characters, and the value that sat on 54 lines of a PUBLIC compose
+ * A membership test cannot be the guard for this one. The `PLACEHOLDERS` set this file used to
+ * carry refused a fixed list of exact strings and anything under 24 characters, and the value that
+ * sat on 54 lines of a PUBLIC compose
  * file — `estate-only-outbox-secret-00000000000000` — was on no list and was 40 characters, so it
  * passed every service in the estate (micro-org #142). A check that could not fail read as the
  * absence of a problem.
@@ -80,9 +141,9 @@ function requiredSecret(source: Source, name: string, minLength = 24): string {
  * keystrokes, and a measured Shannon entropy floor. It has no NODE_ENV exemption and no escape
  * hatch, so CI generates a real value per run rather than being let through.
  *
- * `required` rather than `requiredSecret`, deliberately: the weaker checks are a strict subset of
- * the stronger ones, and running them first would answer a 40-character placeholder with "must be
- * at least 24 characters" — a message that is true, useless, and points the operator at the wrong
+ * `required` rather than a length pre-check, deliberately: the weaker test is a strict subset of
+ * the stronger one, and running it first would answer a 40-character placeholder with "must be at
+ * least 24 characters" — a message that is true, useless, and points the operator at the wrong
  * property.
  */
 function requiredSigningSecret(source: Source, name: string): string {
@@ -101,11 +162,16 @@ function optional(source: Source, name: string, fallback: string): string {
  *
  * `null` rather than `undefined` for absence, so the field it fills is a value a caller must
  * handle rather than a key that may or may not be there. `buildUpstreams` branches on it directly.
+ *
+ * The empty check stays ahead of the assertion because the compose block interpolates
+ * `${LEDGER_IDENTITY_CREDENTIAL:-}` — an unset credential arrives as the empty string, and that is
+ * the supported mode rather than a malformed one.
  */
-function optionalSecret(source: Source, name: string, minLength = 24): string | null {
+function optionalCredential(source: Source, name: string): string | null {
   const value = source[name]?.trim()
   if (!value) return null
-  return requiredSecret(source, name, minLength)
+  assertServiceCredential(name, value)
+  return value
 }
 
 /**
@@ -345,8 +411,8 @@ export interface Env {
    * ── WHY IT IS STILL OPTIONAL, AND WHY THAT IS NOT THE SAME MISTAKE ────────────────────────────
    *
    * `src/migrator.ts` imports this module, so `ledger-migrate` validates this environment too and
-   * is given `LEDGER_DATABASE_URL` and `OUTBOX_SIGNING_SECRET` and nothing else. `requiredSecret`
-   * here would exit 1 and take the estate's schema with it — the same argument that keeps
+   * is given `LEDGER_DATABASE_URL` and `OUTBOX_SIGNING_SECRET` and nothing else. Making this
+   * required here would exit 1 and take the estate's schema with it — the same argument that keeps
    * `indexerUrl` optional, and the same one wallet makes for its CI `/livez` smoke test.
    *
    * Absence fails closed and fails *legibly*, which is the difference from before: no credential
@@ -415,10 +481,10 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     reconcileNetwork: network,
     indexerUrl: optionalUrl(source, 'INDEXER_URL'),
     indexerDeadlineMs: integer(source, 'LEDGER_INDEXER_DEADLINE_MS', 5_000, 100, 60_000),
-    // Not `requiredSecret`: see the field comment. The absence is caught by a reconciliation run
+    // Optional, not required: see the field comment. The absence is caught by a reconciliation run
     // that names it, which is a check that can fail, rather than by a boot `ledger-migrate` cannot
     // perform.
-    identityCredential: optionalSecret(source, 'LEDGER_IDENTITY_CREDENTIAL'),
+    identityCredential: optionalCredential(source, 'LEDGER_IDENTITY_CREDENTIAL'),
     legacyServiceTokenPresent: (source['LEDGER_SERVICE_TOKEN']?.trim() ?? '').length > 0,
     idempotencyTtlDays: integer(source, 'LEDGER_IDEMPOTENCY_TTL_DAYS', 30, 1, 3_650),
   }

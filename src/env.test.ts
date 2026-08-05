@@ -165,10 +165,69 @@ test('the identity credential is OPTIONAL, because `ledger-migrate` shares this 
 })
 
 test('absent is a supported mode; present-but-rubbish is not', () => {
+  // A hyphen IN THE BODY, because both live estates mint base64url and testnet's really does carry
+  // one. A guard written against custody's "no hyphens" rule passes this test's mainnet-shaped
+  // sibling and kills testnet at boot, which is why the fixture is the awkward one.
   const good = 'cfsc_5ntCPqB0ZQ3xk1r-8LHYyU2eWvJfA6oMdT4siGXn9Kc'
   assert.equal(loadEnv({ ...BASE, LEDGER_IDENTITY_CREDENTIAL: good }).identityCredential, good)
-  assert.throws(() => loadEnv({ ...BASE, LEDGER_IDENTITY_CREDENTIAL: 'changeme' }), /known placeholder/)
-  assert.throws(() => loadEnv({ ...BASE, LEDGER_IDENTITY_CREDENTIAL: 'cfsc_short' }), /at least 24 characters/)
+
+  const alnum = 'cfsc_5ntCPqB0ZQ3xk1r8LHYyU2eWvJfA6oMdT4siGXn9KcQ'
+  assert.equal(loadEnv({ ...BASE, LEDGER_IDENTITY_CREDENTIAL: alnum }).identityCredential, alnum)
+
+  // Absent stays absent. The compose block interpolates `${LEDGER_IDENTITY_CREDENTIAL:-}`, so an
+  // unconfigured deployment hands this the empty string and must still boot `ledger-migrate`.
+  assert.equal(loadEnv({ ...BASE, LEDGER_IDENTITY_CREDENTIAL: '' }).identityCredential, null)
+  assert.equal(loadEnv({ ...BASE, LEDGER_IDENTITY_CREDENTIAL: '   ' }).identityCredential, null)
+
+  assert.throws(() => loadEnv({ ...BASE, LEDGER_IDENTITY_CREDENTIAL: 'changeme' }), /service credential/)
+
+  // THE UNIT IS BYTES OF KEY MATERIAL. `cfsc_short` used to be refused for being under 24
+  // CHARACTERS, which is the wrong property measured with the wrong unit — the old message was
+  // true and pointed the operator nowhere.
+  assert.throws(() => loadEnv({ ...BASE, LEDGER_IDENTITY_CREDENTIAL: 'cfsc_short' }), /bytes of key material/)
+
+  // THE CASE THE DELETED `PLACEHOLDERS` SET COULD NOT CATCH, and the whole of micro-org#142: 40
+  // characters, on no list, waved through by every service in the estate.
+  assert.throws(
+    () => loadEnv({ ...BASE, LEDGER_IDENTITY_CREDENTIAL: 'estate-only-outbox-secret-00000000000000' }),
+    /service credential/,
+  )
+
+  // Long enough and correctly prefixed, but it is a repeated pattern rather than a key. A length
+  // gate alone accepts this; that is what a length gate is worth.
+  assert.throws(
+    () => loadEnv({ ...BASE, LEDGER_IDENTITY_CREDENTIAL: `cfsc_${'a'.repeat(48)}` }),
+    /entropy/,
+  )
+
+  // A TOKEN where a credential belongs — the ten-minute cliff wearing the fix's clothes, and the
+  // exact confusion that made settlement the estate's only unhealthy container (micro-org#197).
+  assert.throws(
+    () => loadEnv({ ...BASE, LEDGER_IDENTITY_CREDENTIAL: 'eyJhbGciOiJSUzI1NiIsImtpZCI6IjdiNjY1YyJ9.x.y' }),
+    /carries a TOKEN, not a credential/,
+  )
+})
+
+test('no refusal message ever contains the credential', () => {
+  // `EnvError.message` is written to stderr verbatim and the collector ships it, so an echoed
+  // secret moves from one place it should not be to another.
+  const secrets = [
+    'cfsc_short',
+    `cfsc_${'a'.repeat(48)}`,
+    'estate-only-outbox-secret-00000000000000',
+    'eyJhbGciOiJSUzI1NiIsImtpZCI6IjdiNjY1YyJ9.x.y',
+  ]
+  for (const secret of secrets) {
+    assert.throws(
+      () => loadEnv({ ...BASE, LEDGER_IDENTITY_CREDENTIAL: secret }),
+      (err: unknown) => {
+        const message = (err as Error).message
+        assert.equal(message.includes(secret), false, `the value reached the message: ${message}`)
+        assert.ok(message.includes('LEDGER_IDENTITY_CREDENTIAL'), 'the message must name the variable')
+        return true
+      },
+    )
+  }
 })
 
 test('the exchange is dialled at IDENTITY_ISSUER unless IDENTITY_URL says otherwise', () => {
