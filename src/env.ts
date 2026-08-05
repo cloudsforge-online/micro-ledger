@@ -17,12 +17,7 @@
 
 import { hostname } from 'node:os'
 import type { AssetTolerance, LedgerAssetCode } from '@cloudsforge/contracts-money'
-import {
-  MIN_ENTROPY_BASE64,
-  MIN_SECRET_BYTES,
-  assertGeneratedSecret,
-  entropyPerChar,
-} from '@cloudsforge/secrets'
+import { assertGeneratedSecret, assertServiceCredential } from '@cloudsforge/secrets'
 
 /**
  * The service's own name. A constant rather than a variable: it is a property of the repository,
@@ -47,84 +42,27 @@ function required(source: Source, name: string): string {
   return value
 }
 
-/** `cfsc_` then base64url. Identity mints the body with `-` and `_` in the alphabet. */
-const SERVICE_CREDENTIAL = /^cfsc_([A-Za-z0-9_-]+)$/
-
 /**
- * A service credential, held to its SHAPE — the same discipline as `requiredSigningSecret`, and
- * emphatically not the same rule.
+ * ── THE CREDENTIAL GUARD LIVES IN `@cloudsforge/secrets`, NOT HERE ─────────────────────────────
  *
- * This replaces a `PLACEHOLDERS` set of eight exact strings. That set could not fail for the reason
- * micro-org#142 records: the placeholder that reached 44 containers on both networks was 40
- * characters, cleared every length gate, and was not one of the eight. A membership test only ever
- * catches a string somebody already thought of, and the next placeholder is by definition not on it.
+ * This file used to carry its own `assertServiceCredential`, and it was the copy the shared one was
+ * promoted FROM (`runtime/packages/secrets/src/index.ts:333`). Keeping the local copy after the
+ * promotion is the exact drift the package exists to prevent, and it was not free: the local copy
+ * checked the JWT shape, the `cfsc_` prefix, the byte floor and the entropy floor — and NOT the
+ * placeholder markers. So `cfsc_` + a long, high-entropy placeholder cleared every rule it had and
+ * booted ledger with a credential that was never a credential. That hole is what micro-runtime
+ * f01fe52 closed in the shared copy, and ledger did not inherit the fix because it was not calling
+ * the shared copy.
  *
- * ── WHY `assertGeneratedSecret` IS NOT THE GUARD HERE ──────────────────────────────────────────
+ * The hyphen asymmetry that makes this guard subtle — testnet's credential body carries a `-` and
+ * mainnet's does not, so a "no hyphens" rule kills exactly one estate — is documented at length on
+ * the shared function, along with the measured entropy floors. It is deliberately NOT restated
+ * here: two copies of a rule is how the two networks ended up with two rules.
  *
- * It would refuse every credential this estate has ever minted, on both networks, and ledger would
- * exit 1 at boot. It requires the value to be wholly base64 or wholly hex; `cfsc_…` is neither,
- * because of the underscore in its own prefix.
- *
- * The second half is subtler and is why this was measured on the live containers rather than
- * reasoned about. The credential BODY is base64**url**, so it may contain `-` and `_`:
- *
- *     mainnet  cfsc_ + 43 chars, alphanumeric only,     entropy 4.85 bits/char
- *     testnet  cfsc_ + 43 chars, CONTAINS A HYPHEN,     entropy 4.87 bits/char
- *
- * A guard that refuses hyphens — which is exactly what a copy of custody's `assertMasterSecret`
- * does, and every placeholder this estate wrote had one — would have booted mainnet and killed
- * testnet. One environment healthy, one dead, from one rule that looked right in review.
- *
- * ── WHAT IT ASSERTS ────────────────────────────────────────────────────────────────────────────
- *
- * The prefix does most of the work and is not cosmetic: identity issues credentials with it, and
- * `assertGeneratedSecret`'s markers are irrelevant against a value nobody types. It refuses
- * `changeme`, it refuses the 40-character estate placeholder, and it refuses a JWT — which is the
- * ten-minute cliff wearing the fix's clothes and the whole of micro-org#197.
- *
- * The byte floor and the entropy floor are imported rather than restated, so this file cannot drift
- * from the one that guards the signing key.
- *
- * NO MESSAGE BELOW CONTAINS THE VALUE. Lengths and measurements only, and each names the variable
- * and how to get a real one — a refusal an operator cannot act on is an outage, not a control.
+ * `SecretError` rather than `EnvError` now escapes `loadEnv` for a bad credential. That is already
+ * true of `requiredSigningSecret`, which has called the shared `assertGeneratedSecret` all along,
+ * and `index.ts`'s `fatalConfig` handler reads `err.message` off `unknown`.
  */
-function assertServiceCredential(name: string, value: string): void {
-  const fix = `mint one with: deploy/scripts/estate-bootstrap.sh`
-
-  if (/^ey[A-Za-z0-9_-]*\./.test(value)) {
-    throw new EnvError(
-      `${name} carries a TOKEN, not a credential — a JWT is minted with a ten-minute life and is ` +
-        `dead ten minutes after the boot that read it (micro-org#197). ${fix}`,
-    )
-  }
-
-  const match = SERVICE_CREDENTIAL.exec(value)
-  if (!match) {
-    throw new EnvError(
-      `${name} is not a service credential — identity mints these with a 'cfsc_' prefix, and a ` +
-        `credential is generated rather than typed. ${fix}`,
-    )
-  }
-
-  const body = match[1] ?? ''
-  // BYTES of key material, not keystrokes. base64url carries 6 bits per character, and the unit a
-  // 24-character minimum was reaching for was never characters.
-  const bytes = Math.floor((body.length * 6) / 8)
-  if (bytes < MIN_SECRET_BYTES) {
-    throw new EnvError(
-      `${name} carries ${bytes} bytes of key material and at least ${MIN_SECRET_BYTES} are ` +
-        `required — length in CHARACTERS is not the unit that matters. ${fix}`,
-    )
-  }
-
-  const measured = entropyPerChar(body)
-  if (measured < MIN_ENTROPY_BASE64) {
-    throw new EnvError(
-      `${name} is long enough but its entropy is ${measured.toFixed(2)} bits per character, below ` +
-        `the ${MIN_ENTROPY_BASE64} floor — a repeated pattern is not a key. ${fix}`,
-    )
-  }
-}
 
 /**
  * The estate's shared event-bus HMAC key, held to a shape rather than to a deny-list.

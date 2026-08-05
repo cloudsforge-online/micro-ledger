@@ -206,6 +206,17 @@ test('absent is a supported mode; present-but-rubbish is not', () => {
     () => loadEnv({ ...BASE, LEDGER_IDENTITY_CREDENTIAL: 'eyJhbGciOiJSUzI1NiIsImtpZCI6IjdiNjY1YyJ9.x.y' }),
     /carries a TOKEN, not a credential/,
   )
+
+  // THE PREFIX IS NOT THE CREDENTIAL, and this is the case ledger's own deleted copy let through
+  // (micro-org#229). It is correctly prefixed, it is 43 body characters, it clears the 32-byte
+  // floor and it measures well above the 4.0 entropy floor — so the JWT check, the prefix check,
+  // the byte check and the entropy check ALL pass it. Only the placeholder markers refuse it, and
+  // the local copy was the one assertion in the estate that never ran them. A CI workflow here was
+  // written against exactly this hole.
+  assert.throws(
+    () => loadEnv({ ...BASE, LEDGER_IDENTITY_CREDENTIAL: 'cfsc_ci-only-NOT-a-real-credential-9xKq2mZ7vB' }),
+    /reads as a placeholder/,
+  )
 })
 
 test('no refusal message ever contains the credential', () => {
