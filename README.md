@@ -323,7 +323,8 @@ this service's own is still fatal, and both at once is still fatal. The distinct
 rather than discarded, which is the point — a skip nobody can see is how blind spots start.
 
 So the guarantee is still validated by running it, not by the badge. The loop has been driven
-against a real EMBER testnet — chain id 7412, a miner producing blocks — to
+against a real EMBER testnet — chain id 7412 (`0x1cf4`), a miner producing blocks; the same
+network is now public at `https://rpc-testnet.cloudsforge.online` — to
 `observed_source = 'indexer'` with drift of **exactly 0 over 31000000000000000000 wei**, then made
 to refuse and re-freeze with the custody set emptied, then clean again on restore. And since the
 credential fix, proven past its own expiry: a second reconciliation **661 seconds** after boot,
