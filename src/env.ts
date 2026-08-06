@@ -46,7 +46,7 @@ function required(source: Source, name: string): string {
  * ── THE CREDENTIAL GUARD LIVES IN `@cloudsforge/secrets`, NOT HERE ─────────────────────────────
  *
  * This file used to carry its own `assertServiceCredential`, and it was the copy the shared one was
- * promoted FROM (`runtime/packages/secrets/src/index.ts:333`). Keeping the local copy after the
+ * promoted FROM (`runtime/packages/secrets/src/index.ts`). Keeping the local copy after the
  * promotion is the exact drift the package exists to prevent, and it was not free: the local copy
  * checked the JWT shape, the `cfsc_` prefix, the byte floor and the entropy floor — and NOT the
  * placeholder markers. So `cfsc_` + a long, high-entropy placeholder cleared every rule it had and
@@ -258,7 +258,7 @@ export interface Env {
    * first sweep after deploy. Whoever reads this because a page fired should read the argument
    * before reaching for the workaround.
    *
-   * `ON_CHAIN_ASSETS` (contracts/packages/chain/src/index.ts:123) lists EMBER, so `reconcileAsset`
+   * `ON_CHAIN_ASSETS` (contracts/packages/chain/src/index.ts) lists EMBER, so `reconcileAsset`
    * demands an observation for it and records `unavailable` / `failed` without one. Hearth's
    * mainnet has not launched, so today there is nothing feeding it. The question is whether EMBER
    * should therefore be exempted, and the answer is no, for four reasons:
@@ -268,7 +268,7 @@ export interface Env {
    *      warns against when it refuses to re-declare asset codes.
    *   2. **A pre-launch chain asset is not a special case, it is the worst case.** If Hearth has
    *      not launched then no EMBER is backed by anything, and custodial EMBER existing under those
-   *      conditions IS `00-current-state.md:22` — "Custodial EMBER can be minted with no chain
+   *      conditions IS `00-current-state.md` — "Custodial EMBER can be minted with no chain
    *      movement" — rather than a temporary inconvenience on the way to fixing it.
    *   3. **The failure is proportionate to what is actually at risk.** If EMBER custody is zero,
    *      the freeze costs nothing: there is nothing to withdraw. If it is NOT zero, then the
@@ -299,8 +299,8 @@ export interface Env {
    * member — the configuration is incoherent without it, and "a missing variable names itself" is
    * this file's first principle. **It would kill the estate.** `src/migrator.ts` imports this
    * module, so `ledger-migrate` — the one-shot container every other ledger container waits on
-   * (`docker-compose.estate.yml:474`) — validates this environment too, and it is given
-   * `LEDGER_DATABASE_URL` and `OUTBOX_SIGNING_SECRET` and nothing else (`:388-397`). It does not
+   * (`docker-compose.estate.yml`) — validates this environment too, and it is given
+   * `LEDGER_DATABASE_URL` and `OUTBOX_SIGNING_SECRET` and nothing else. It does not
    * set `LEDGER_RECONCILE_ASSETS` either, so it would inherit the `SHARD,EMBER` default, demand an
    * indexer it has no business calling, exit 1, and take the estate's schema with it. That is the
    * same class of failure as the literal cross-repo import that broke `indexer-migrate`: found by
@@ -330,7 +330,7 @@ export interface Env {
    * ════════════════════════════════════════════════════════════════════════════════════════════
    * **IT REPLACES `LEDGER_SERVICE_TOKEN`, AND THE REPLACEMENT IS THE WHOLE POINT.**
    *
-   * That variable held a **600-second** token (`identity/src/tokens.ts:28`), read once at import,
+   * That variable held a **600-second** token (`identity/src/tokens.ts`), read once at import,
    * and the reconciliation job runs every **900 seconds** (`jobs.ts:recurringJobs`). So the chain
    * half of the solvency invariant authenticated exactly once per bootstrap and never again: from
    * minute ten onwards every sweep got a 401, every 401 mapped to `undefined`, every `undefined`

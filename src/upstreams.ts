@@ -4,11 +4,11 @@
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  * ## THE FIFTEEN-MINUTE JOB AND THE TEN-MINUTE TOKEN
  *
- * `LEDGER_SERVICE_TOKEN` held a token that lives **600 seconds** (`identity/src/tokens.ts:28`).
+ * `LEDGER_SERVICE_TOKEN` held a token that lives **600 seconds** (`identity/src/tokens.ts`).
  * The reconciliation job runs every **900 seconds** (`jobs.ts:recurringJobs`). The composition root
  * read the variable once, at import:
  *
- *     token: () => env.indexerToken            // index.ts:155, for the life of the service
+ *     token: () => env.indexerToken            // index.ts, for the life of the service
  *
  * so the chain half of the solvency invariant authenticated **exactly once per bootstrap** — at
  * boot, before the first sweep — and never again. Every sweep from minute ten onwards presented a

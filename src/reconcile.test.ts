@@ -119,15 +119,15 @@ async function mintUnbackedLiability(amount: bigint): Promise<void> {
 /**
  * **THE FINDING THIS COMMIT EXISTS FOR, WRITTEN AS A TEST THAT PASSED BEFORE IT.**
  *
- * `docs/ecosystem/00-current-state.md:22` records the sin the estate is migrating away from:
+ * `docs/ecosystem/00-current-state.md` records the sin the estate is migrating away from:
  * "Custodial EMBER can be minted with no chain movement." The owner's decision is that the
  * economics of the ecosystem must be **valid from chain**.
  *
- * The check that was supposed to hold that property could not fail. `reconcile.ts:163` read
+ * The check that was supposed to hold that property could not fail. `reconcile.ts` read
  *
  *     observedSource = input.indexerObservedTotal !== undefined ? 'indexer' : 'liability_sum'
  *
- * and NO CALLER EVER SUPPLIED ONE. `jobs.ts:187` — the scheduled sweep, the only production
+ * and NO CALLER EVER SUPPLIED ONE. `jobs.ts` — the scheduled sweep, the only production
  * caller in the estate — passed `assetCode`, `chain`, `network`, `tolerance` and `producer`, and
  * nothing else. `grep -rn indexerObservedTotal ledger/src` found it set in exactly one place: a
  * test. So **every reconciliation this service has ever run in anger took the `liability_sum`
@@ -147,7 +147,7 @@ async function mintUnbackedLiability(amount: bigint): Promise<void> {
  * Written first with the pre-fix assertions and run green, which is how the following was found and
  * it was not in the plan. Ordering the two runs as they are ordered here — the honest one first —
  * the vacuous run that followed did not merely return a meaningless `clean`. Because `clean` is
- * exactly the status that lifts a freeze (`reconcile.ts:204`, and that asymmetry is correct), the
+ * exactly the status that lifts a freeze (`reconcile.ts`, and that asymmetry is correct), the
  * `liability_sum` run **deleted the `asset_freezes` row** the indexer-backed run had just written:
  *
  *     assert.equal(unobserved.unfroze, true)      // passed, before this commit
@@ -160,7 +160,7 @@ async function mintUnbackedLiability(amount: bigint): Promise<void> {
  */
 test('THE DEFECT: a deposit that never happened on chain reconciles CLEAN with no observation', { skip }, async () => {
   // A fabricated deposit of an ON-CHAIN asset: custody is debited and the user credited, in one
-  // balanced entry, with no transaction behind it on any chain. This is 00-current-state.md:22.
+  // balanced entry, with no transaction behind it on any chain. This is 00-current-state.md.
   await post(depositEntry({ amount: 5_000n, assetCode: 'EMBER' }))
 
   // What the chain actually holds. Nothing.
@@ -616,11 +616,11 @@ test('SCHEMA: chain_assets is exactly ON_CHAIN_ASSETS, or this whole guard is ai
  * **A COMPLETED RECONCILIATION TOLD NOBODY, FOR THE LIFE OF THIS SERVICE.**
  *
  * `ledger.reconciliation.completed` was registered with `producer: 'ledger'` before the service
- * existed. `activity/src/classify.ts:335` classifies it as `wallet.reconciliation_completed` and
- * reads `drift` off the payload; `analytics/src/catalogue.ts:312` records it, deliberately
+ * existed. `activity/src/classify.ts` classifies it as `wallet.reconciliation_completed` and
+ * reads `drift` off the payload; `analytics/src/catalogue.ts` records it, deliberately
  * impersonal, "kept because a reconciliation freeze explains a hole in every funnel that week";
- * `notify/src/catalogue.ts:842` files it under NON_NOTIFYING_TOPICS with a written reason — no
- * individual user is its subject — which is a decision rather than a gap. `server.ts:528` already
+ * `notify/src/catalogue.ts` files it under NON_NOTIFYING_TOPICS with a written reason — no
+ * individual user is its subject — which is a decision rather than a gap. `server.ts` already
  * serves `GET /reconciliation`, and `docs/ecosystem/05-user-journeys.md` J14 is an operator
  * responding to a drift alert.
  *
@@ -712,7 +712,7 @@ test('THE READER: activity can read the drift off a real event, and a freeze is 
   assert.equal(delivered.actor, 'system')
   assert.equal(delivered.correlationId, row.id)
 
-  // `activity/src/classify.ts:341` renders "Reconciliation completed with drift <drift>" and reads
+  // `activity/src/classify.ts` renders "Reconciliation completed with drift <drift>" and reads
   // the field by that name. An absent field would render the bare sentence and the operator would
   // never learn a number — the "absent is null to every reader" trap, so it is asserted present and
   // asserted to be the RIGHT number rather than merely a number.

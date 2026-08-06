@@ -12,7 +12,7 @@
  * This repository was wrong in the direction that is hardest to see, because nothing breaks and
  * nothing logs: **a registry topic this service owns that no emit site produced.**
  * `ledger.reconciliation.completed` has been registered with `producer: 'ledger'` since before the
- * service existed, `activity/src/classify.ts:335` classifies it, `analytics/src/catalogue.ts:312`
+ * service existed, `activity/src/classify.ts` classifies it, `analytics/src/catalogue.ts`
  * records it, and `reconcile.ts` finished a run, froze withdrawals and told nobody. Both consumers
  * were dead code for the life of the service. Nothing anywhere reported it, because a topic that is
  * never sent produces no error — it produces silence, and silence is what a working system also
@@ -33,7 +33,7 @@
  * ## Why the scan cannot look for `topic:`
  *
  * `ledger.entry.posted` is written by a **raw `insert into outbox (topic, …) values ('ledger.entry.
- * posted', …)`** at `entries.ts:427` — there is no `topic:` property anywhere near it, and there is
+ * posted', …)`** at `entries.ts` — there is no `topic:` property anywhere near it, and there is
  * no emitter function to find either. A scan for the emit-site shape returns nothing here and passes
  * vacuously. `micro-org`'s estate checker had to be taught the same lesson. The scan is therefore for
  * every well-formed `ledger.*.*` STRING LITERAL, which finds both spellings and also finds a

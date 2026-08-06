@@ -70,7 +70,7 @@ import type { UnobservedReason } from './indexerclient.ts'
 /**
  * Is this asset settled on a chain, and therefore only ever attestable BY a chain?
  *
- * `ON_CHAIN_ASSETS` (contracts/packages/chain/src/index.ts:123) is the estate's declaration and is
+ * `ON_CHAIN_ASSETS` (contracts/packages/chain/src/index.ts) is the estate's declaration and is
  * read here rather than restated. The `chain_assets` table migration 11 seeds is the same list in
  * the one other place that needs it — the database, which cannot import TypeScript — and
  * `reconcile.test.ts` asserts the two are equal so neither can drift in silence.
@@ -92,7 +92,7 @@ export function isOnChainAsset(assetCode: LedgerAssetCode): boolean {
  * EXISTED.** `micro-org`'s estate-wide check recorded it as `unemitted:ledger.reconciliation.
  * completed` and this repository re-verified the finding against its own source rather than taking
  * it on trust: the literal appeared nowhere in `ledger/src`, and the only outbox write in the whole
- * service was `ledger.entry.posted` at `entries.ts:427`.
+ * service was `ledger.entry.posted` at `entries.ts`.
  *
  * It is NOT the `custody.key.exported` shape and the difference decides the repair. Custody looked
  * unemitted but was in fact emitting `custody.export.completed` — the same fact under a name no
@@ -103,15 +103,15 @@ export function isOnChainAsset(assetCode: LedgerAssetCode): boolean {
  *
  * Nor should it be deregistered, because it has readers and they are load-bearing:
  *
- *   - `activity/src/classify.ts:335` files it as `wallet.reconciliation_completed`, `internal`,
+ *   - `activity/src/classify.ts` files it as `wallet.reconciliation_completed`, `internal`,
  *     reading `drift` off the payload. Dead code until this commit.
- *   - `analytics/src/catalogue.ts:312` records it as `reconciliation_completed`, deliberately
+ *   - `analytics/src/catalogue.ts` records it as `reconciliation_completed`, deliberately
  *     impersonal, "kept because a reconciliation freeze explains a hole in every funnel that week".
  *     Dead code until this commit.
- *   - `notify/src/catalogue.ts:842` lists it under NON_NOTIFYING_TOPICS with a written reason — no
+ *   - `notify/src/catalogue.ts` lists it under NON_NOTIFYING_TOPICS with a written reason — no
  *     individual user is its subject. That is a DECISION rather than a gap, and it stays correct.
  *   - `docs/ecosystem/05-user-journeys.md` J14 is an operator responding to a drift alert, and
- *     `server.ts:528` already serves `GET /reconciliation` returning runs and freezes. The console
+ *     `server.ts` already serves `GET /reconciliation` returning runs and freezes. The console
  *     could show a drift only by polling; nothing told it a run had finished.
  *
  * So the answer to "does a completed reconciliation notify anyone" was: no, not by any route, and
@@ -387,13 +387,13 @@ export async function reconcileAsset(sql: Db, input: ReconcileInput): Promise<Re
       // **Every number is a STRING, and that is not a style choice.** These are `numeric(78,0)` and
       // routinely exceed 2^53; a JSON number would round them, and rounding the two sides of a
       // reconciliation by different amounts invents the exact drift this job exists to detect.
-      // `activity/src/classify.ts:341` reads `drift` through its `amount()` reader, which takes a
+      // `activity/src/classify.ts` reads `drift` through its `amount()` reader, which takes a
       // string.
       //
       // **`drift` and `indexerObservedTotal` are now `string | null`, and null is deliberate on the
       // wire.** A consumer must be able to tell "no difference" from "no observation"; sending 0 for
       // both is the defect this commit removes, re-committed one layer out. `amount()` at
-      // `activity/src/classify.ts:94` requires `typeof value === 'string'` and returns null
+      // `activity/src/classify.ts` requires `typeof value === 'string'` and returns null
       // otherwise, so its summary already degrades to "Reconciliation completed." rather than
       // announcing a drift of zero that nobody measured — checked, not assumed.
       payload: {

@@ -101,7 +101,7 @@ import { ON_CHAIN_ASSETS, type Network } from '@cloudsforge/contracts-chain'
  * The scopes this service's token must carry to call the indexer.
  *
  * `GET /v1/custody/:chain/:network/total` is the ONE domain read on that service which demands a
- * token (`indexer/src/server.ts:582`), and the argument for the exception is why this constant
+ * token (`indexer/src/server.ts`), and the argument for the exception is why this constant
  * exists: every other read answers a question about a block, a hash or an address the caller
  * already named, and naming it is what makes the answer public. This one answers a question about
  * a SET only the platform knows — the size of the estate's custody position — so serving it
@@ -121,14 +121,14 @@ export const INDEXER_SCOPES: readonly LiveScope[] = Object.freeze(['indexer:read
  * The chain slug the indexer's URLs use, for an asset this service reconciles.
  *
  * The indexer's `ChainId` is "the asset code lowercased, which is also what `txUrn` uses, so a path
- * segment and a cross-service URN cannot drift apart" (`indexer/src/chains.ts:32`). That is read
+ * segment and a cross-service URN cannot drift apart" (`indexer/src/chains.ts`). That is read
  * and applied here rather than restated as a second map: a hand-written table would be a copy of a
  * fact that lives in another repository, and copies rot silently — which is the finding that
  * produced `derive-grants.mjs` in the first place.
  *
  * `undefined` for anything with no chain behind it. The caller must not ask the indexer about
  * SHARD: it is in `CHAINS` only so that record is total, the indexer refuses the slug outright
- * (`chains.ts:37` — "an indexer that accepted it would be advertising an endpoint that can only
+ * (`chains.ts` — "an indexer that accepted it would be advertising an endpoint that can only
  * ever answer empty"), and a 404 there would be read here as an unobservable asset and freeze
  * something that has no chain to be backed by.
  */

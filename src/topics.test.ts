@@ -3,8 +3,8 @@
  *
  * The defect this repository held was the one that is hardest to see: **a registry topic this
  * service owns that no emit site produced.** `ledger.reconciliation.completed` was registered with
- * `producer: 'ledger'` before the service existed, `activity/src/classify.ts:335` classified it and
- * `analytics/src/catalogue.ts:312` recorded it, and `reconcile.ts` finished a run, froze withdrawals
+ * `producer: 'ledger'` before the service existed, `activity/src/classify.ts` classified it and
+ * `analytics/src/catalogue.ts` recorded it, and `reconcile.ts` finished a run, froze withdrawals
  * and told nobody. Both consumers were dead code for the life of the service. Nothing reported it,
  * because a topic that is never sent produces silence, and silence is what a working system also
  * produces.
@@ -95,7 +95,7 @@ function isJobKindDeclaration(line: string): boolean {
  * Every topic literal in this service's namespace that appears anywhere in `src/`.
  *
  * **Not a scan for `topic: '<name>'`.** `ledger.entry.posted` is written by a raw
- * `insert into outbox (topic, …) values (…)` at `entries.ts:427` with no `topic:` property anywhere
+ * `insert into outbox (topic, …) values (…)` at `entries.ts` with no `topic:` property anywhere
  * near it and no emitter function to find, so an emit-site scan returns nothing here and passes
  * vacuously. Matching every well-formed `ledger.*.*` string literal finds it, finds the constant
  * form, and also finds a CONSTANT that no emit site uses — a name a consumer could subscribe to for
@@ -362,7 +362,7 @@ test('the delivery this relay signs is one a contract-following consumer verifie
 /**
  * A guard that proves a topic name is correct proves nothing about whether the emit is reached.
  *
- * `identity/src/sessions.ts:390` exports `emitSessionRevoked` and NOTHING CALLS IT — so
+ * `identity/src/sessions.ts` exports `emitSessionRevoked` and NOTHING CALLS IT — so
  * `identity.session.revoked` is produced by dead code while identity's own guard passes, because it
  * scans literals rather than reachability. This is the cheapest check that catches that exact shape,
  * and it is the same shape as this repository's own defect one level down: a name that is correct

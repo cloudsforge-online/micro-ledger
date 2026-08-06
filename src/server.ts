@@ -655,7 +655,7 @@ async function authorise(ctx: RequestContext, deps: ServerDeps, scope: string): 
  * That is not a hypothetical. On 2026-08-04 a `deposit_credited` for 5000000000000000000 wei of
  * EMBER was posted against no on-chain deposit; the row read `originating_service = 'wallet'`,
  * `actor = 'service:wallet'`, and it was not wallet. `micro-wallet` posts to this service from
- * exactly five call sites (`money.ts:473`, `deposits.ts:601`, `withdrawals.ts:380/535/627`), every
+ * exactly five call sites (`money.ts`, `deposits.ts`, `withdrawals.ts/535/627`), every
  * one of them a real money operation, and it has no probe path at all. The incident response
  * nonetheless began by looking for one, because the journal said wallet and the journal was the
  * evidence. **A caller-supplied attribution is not evidence, and this service publishes it as

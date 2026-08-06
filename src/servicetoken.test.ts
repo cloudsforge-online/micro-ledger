@@ -4,7 +4,7 @@
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  * ## The defect
  *
- * `LEDGER_SERVICE_TOKEN` held a token that lives **600 seconds** (`identity/src/tokens.ts:28`).
+ * `LEDGER_SERVICE_TOKEN` held a token that lives **600 seconds** (`identity/src/tokens.ts`).
  * The reconciliation job runs every **900 seconds** (`jobs.ts:recurringJobs`). The composition root
  * read the variable once, at import — `token: () => env.indexerToken` — so the chain half of the
  * solvency invariant authenticated once per bootstrap and never again. Every sweep from minute ten
@@ -72,7 +72,7 @@ import type { Db } from './outbox.ts'
 /** One EMBER, in wei. */
 const ONE = 1_000_000_000_000_000_000n
 
-/** identity/src/tokens.ts:28. Unchanged by this fix, and it must stay unchanged — rotation IS expiry. */
+/** identity/src/tokens.ts. Unchanged by this fix, and it must stay unchanged — rotation IS expiry. */
 const SERVICE_TTL_SECONDS = 600
 
 /** jobs.ts:recurringJobs. The number that makes the one above a defect rather than a detail. */
@@ -170,7 +170,7 @@ async function world(): Promise<World> {
         )
       }
 
-      // The custody route. Guarded exactly as `indexer/src/server.ts:582` guards it: this is the one
+      // The custody route. Guarded exactly as `indexer/src/server.ts` guards it: this is the one
       // domain read on that service that demands a token, because it answers a question about a SET
       // only the platform knows.
       //
