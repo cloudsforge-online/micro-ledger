@@ -150,9 +150,15 @@ attempt budget is a ledger that has stopped being checked (`src/jobs.ts`).
 
 `jobs`, `outbox`, `event_subscriptions`, `outbox_deliveries`, `inbox`, `accounts`,
 `journal_entries`, `postings`, `balances`, `idempotency_keys`, `reconciliation_runs`,
-`asset_freezes`, `balances_shadow`, `chain_assets` — versioned migrations 1–11 in
-`src/migrations.ts`, run only by `src/migrator.ts`. `index.ts` asserts the version and refuses to
-serve below it (`src/index.ts`).
+`asset_freezes`, `balances_shadow`, `chain_assets`, `retired_assets` — the last of those holding
+the wound-down asset codes a trigger reads so that a retired unit stays movable and drainable but
+can never again be sold or credited (migration 13). All of them come from the numbered migrations
+in `src/migrations.ts`, run only by `src/migrator.ts`. The highest version is deliberately not
+typed into this paragraph: `SCHEMA_VERSION` is computed at the foot of `src/migrations.ts` as the
+maximum version in that list, and `index.ts` asserts it at boot and refuses to serve below it
+(`src/index.ts`). A hand-typed range goes stale the day a migration lands and nobody thinks to
+retype it, which is precisely what this sentence did — it read "1–11" for three migrations after
+that stopped being true, while the schema the service actually demanded had moved on.
 
 `chain_assets` is reference data, not state: the five codes in `ON_CHAIN_ASSETS`
 (`contracts/packages/chain/src/index.ts`), seeded by migration 11 so that a constraint can read
@@ -412,9 +418,23 @@ where the first token had already been refused with a real 401 by the real index
   `vault` network); that is a topology guarantee, not a service one.
 * **`ledger.source` — the per-product revenue question.** `ledger_postings_total` is labelled
   `(service, kind)` precisely so "how much did ForgeMint earn" becomes answerable
-  (`src/server.ts`), but the note there records that only `/internal/*` routes populate the
-  originating service in the estate today. This service has no `/internal/*` routes at all, so the
-  label is only as good as what each caller passes in `originatingService`.
+  (`src/server.ts`). The `service` half is no longer taken on trust: since the forged
+  `deposit_credited` of 2026-08-04, `attribute()` in `src/server.ts` compares the body's
+  `originatingService` against the service the caller's token was actually minted for and refuses
+  the write with a 403 when the two disagree — on every route that writes, being `POST /entries`,
+  `/entries/:id/reverse`, `/reservations` and `/reservations/:id/release`. It refuses rather than
+  quietly stamping the principal's own name over the claim, so a caller that believes it is posting
+  under somebody else's name finds out instead of being silently relabelled. What genuinely still
+  rests on the caller is the rest of the row. `kind` is held to the closed vocabulary by
+  `journal_entries_kind_chk` (`src/migrations.ts`), but nothing checks that the caller picked the
+  honest member of it, so the second label is an assertion. `actor` is bound only in its
+  `service:<name>` form; `system` and `user:<id>` are unverified by design, because a scheduled
+  sweep and an operator acting through a service are both real and neither is a claim about *which*
+  service. And the label answers **which service**, not which product: `ledger.source` is the field
+  that would carry the second, only `/internal/*` routes populate it anywhere in the estate, and
+  this service has no `/internal/*` routes at all. None of this is a solvency control either — a
+  caller holding another service's own credential can still post an unbacked credit under that
+  service's true name, and reconciliation against the chain, not this check, is what catches that.
 * **No path versioning.** This service serves `/entries`, not `/v1/entries`. The estate is split
   down the middle — `wallet`, `market`, `mint` and `worlds` serve `/v1/…`, `ledger`, `foresight`,
   `pricing`, `activity` and `identity` do not — and the public API is specified as URL-versioned
