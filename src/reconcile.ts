@@ -175,6 +175,25 @@ export interface ReconcileInput {
    * the schema refuses one that claims otherwise.
    */
   readonly unobservedReason?: UnobservedReason
+  /**
+   * Where the observed total sits, split by custody label — for the freeze message, and nothing else.
+   *
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   * A drift freeze used to say two numbers: what the ledger thinks custody holds, and what the chain
+   * showed. Two numbers establish that the estate and the chain disagree. They do not say WHERE, and
+   * "where" is the whole of the next hour: deposit balances are users' coin moved by `micro-wallet`,
+   * treasury float is the platform's own moved by `micro-settlement`, and a shortfall in one is a
+   * different incident — different code, different blast radius — from a shortfall in the other. The
+   * 2026-08-05 freeze was a treasury registration and read, from the message, exactly like a
+   * deposit-sweep shortfall.
+   *
+   * **A string, and it enters no arithmetic.** It is interpolated into `asset_freezes.reason` and
+   * touches nothing else: not the drift, not the status, not the row. `indexerclient.breakdownFrom`
+   * builds and bounds it; this module clamps the length again below, because a value that has
+   * travelled from another service's JSON to a column an operator reads is worth distrusting twice.
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   */
+  readonly observedBreakdown?: string
 }
 
 /**
@@ -230,6 +249,31 @@ async function totalFor(sql: Db | Tx, type: string, assetCode: string, subject?:
        and (${subject ?? null}::text is null or a.subject = ${subject ?? null})
   `
   return BigInt(rows[0]?.total ?? '0')
+}
+
+/** Longer than any honest breakdown of eight buckets, and short enough to read in a console cell. */
+const MAX_BREAKDOWN = 300
+
+/**
+ * The breakdown clause, or nothing at all.
+ *
+ * The second clamp on a value `indexerclient.breakdownFrom` has already bounded, and deliberately
+ * not a shared helper: this module is the one that writes the column, and the property "a freeze
+ * reason is a bounded string" should hold for every caller of `reconcile`, including tests, future
+ * callers, and any observer that is not the HTTP client. A guarantee that lives only in the producer
+ * is a guarantee the next producer will not know about.
+ *
+ * Truncation is marked `…` and the phrase is prefixed with `=` rather than being run on, so a reader
+ * can see where the checkable arithmetic ends and the reported split begins. An empty or
+ * whitespace-only value is absent rather than an empty clause.
+ */
+function observedBreakdownFor(breakdown: string | undefined): string {
+  if (breakdown === undefined) return ''
+  const trimmed = breakdown.trim()
+  if (trimmed.length === 0) return ''
+  const clamped =
+    trimmed.length > MAX_BREAKDOWN ? `${trimmed.slice(0, MAX_BREAKDOWN)}…` : trimmed
+  return ` = ${clamped}`
 }
 
 /**
@@ -335,12 +379,20 @@ export async function reconcileAsset(sql: Db, input: ReconcileInput): Promise<Re
       // observation" whether the chain was unlaunched or this service's own token had expired
       // fifteen minutes into a fifteen-minute job. Those need opposite responses — wait, versus
       // look at identity — and they were one sentence.
+      //
+      // The drift message now also says WHERE the observed side sits, when the observer said. See
+      // `observedBreakdown` on the input: "drift 3" tells an operator the estate and the chain
+      // disagree; "drift 3 … observed 41000000 = deposit: 41000000 over 12 addresses, treasury: 0
+      // over 1" tells them which of two different incidents they are in. Appended rather than
+      // interleaved, so the arithmetic reads identically to every freeze recorded before this
+      // change and the prose that cannot be checked comes after the numbers that can.
+      const breakdown = observedBreakdownFor(input.observedBreakdown)
       const reason =
         observedTotal === null
           ? `reconciliation failed: no indexer observation for on-chain asset ${input.assetCode}` +
             ` (custody ${custodyTotal.toString()}; chain holdings UNKNOWN, not zero;` +
             ` reason ${String(unobservedReason)})`
-          : `reconciliation ${status}: drift ${String(drift)} (custody ${custodyTotal.toString()}, observed ${observedTotal.toString()})`
+          : `reconciliation ${status}: drift ${String(drift)} (custody ${custodyTotal.toString()}, observed ${observedTotal.toString()}${breakdown})`
 
       // `on conflict do update` rather than `do nothing`: a still-drifting asset must carry the
       // reason and run id of the LATEST run, or an operator reads the arithmetic of a run that has

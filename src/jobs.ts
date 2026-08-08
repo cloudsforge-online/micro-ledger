@@ -38,7 +38,12 @@ import { type AssetTolerance, type LedgerAssetCode, isChainAsset } from '@clouds
 import { chainSpec } from '@cloudsforge/contracts-chain'
 import { rebuildBalances } from './balances.ts'
 import { reconcileAsset } from './reconcile.ts'
-import { indexerChainFor, type IndexerClient, type UnobservedReason } from './indexerclient.ts'
+import {
+  indexerChainFor,
+  type IndexerClient,
+  type Observation,
+  type UnobservedReason,
+} from './indexerclient.ts'
 import { reapIdempotencyKeys } from './idempotency.ts'
 import { createRelay, type RelayDeps, type Db } from './outbox.ts'
 
@@ -303,11 +308,11 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
      *   * **`deps.indexer === undefined`** is a deployment with no `INDEXER_URL`. Nothing was
      *     dialled, and that IS a fact about this deploy manifest — `not_configured`.
      */
-    const observation =
+    const observation: Observation =
       chainSlug === undefined
-        ? { total: undefined, reason: null }
+        ? { total: undefined, reason: null, breakdown: null }
         : deps.indexer === undefined
-          ? { total: undefined, reason: 'not_configured' as const }
+          ? { total: undefined, reason: 'not_configured' as const, breakdown: null }
           : await deps.indexer.observe(chainSlug, network)
 
     const result = await reconcileAsset(deps.sql, {
@@ -322,7 +327,14 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
       // site rather than a value that happened to be undefined.
       ...(observation.total === undefined
         ? { ...(observation.reason ? { unobservedReason: observation.reason } : {}) }
-        : { indexerObservedTotal: observation.total }),
+        : {
+            indexerObservedTotal: observation.total,
+            // Same conditional-spread discipline, and for a sharper reason than the total's: a
+            // freeze message that said `observed 41000000 = ` with nothing after it would read as
+            // "the split is empty", which is a claim about the chain. Absent means the observer did
+            // not say, and absent is written as an absent key.
+            ...(observation.breakdown === null ? {} : { observedBreakdown: observation.breakdown }),
+          }),
     })
 
     // **`Number(null)` is `0`.** This line read `Number(result.drift)` unconditionally, and now that

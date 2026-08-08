@@ -203,6 +203,30 @@ export interface Observation {
   readonly total: bigint | undefined
   /** `null` exactly when `total` is a number. */
   readonly reason: UnobservedReason | null
+  /**
+   * Where the observed side sits, split by custody label — **prose, and nothing else.**
+   *
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   * `deposit: 41000000 over 12 addresses, treasury: 9000000 over 1`. It exists so a freeze can name
+   * its own cause: deposits and treasury float are different money held by different code, and a
+   * drift in one is a different incident from a drift in the other. The 2026-08-05 freeze was a
+   * treasury registration and read, from the message, exactly like a deposit-sweep shortfall.
+   *
+   * **Typed `string`, which is the safety property and not a convenience.** `Observation` is the
+   * type the reconciliation's arithmetic is built from, and this module's whole discipline is that
+   * `totalFrom` is the only thing in it that can produce a number. A `readonly buckets: bigint[]`
+   * would put a second numeric member on the type the solvency check reads, and the next edit that
+   * summed it — as a cross-check, as a fallback when `total` is missing, as anything — would be
+   * comparing the ledger against a figure this file never validated as a total. A string has no
+   * such affordance. It is built by `breakdownFrom` below, which is pure, bounded, and cannot
+   * return anything the schema has not been shown.
+   *
+   * `null` whenever the answer carried no usable breakdown, and a missing breakdown is never a
+   * reason to withhold a total: the split is a diagnosis, and an indexer too old to send one still
+   * knows what the chain holds.
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   */
+  readonly breakdown: string | null
 }
 
 export interface IndexerClientOptions {
@@ -300,13 +324,15 @@ export function httpIndexerClient(options: IndexerClientOptions): IndexerClient 
         // statement in the function reachable from a caught error, and it is a literal `undefined`.
         // `reasonFor` is handed the error and can answer with one of eight strings; it never sees
         // the body and has no path to `totalFrom`.
-        return { total: undefined, reason: reasonFor(err) }
+        return { total: undefined, reason: reasonFor(err), breakdown: null }
       }
       // The one statement in this module that yields a number, and `totalFrom` is the only thing
       // that decides. `undefined` here means a 200 arrived and was not a total — a different fact
       // from every case above, and one an operator diagnoses at the indexer rather than at identity.
       const total = totalFrom(body)
-      return total === undefined ? { total: undefined, reason: 'unusable_answer' } : { total, reason: null }
+      return total === undefined
+        ? { total: undefined, reason: 'unusable_answer', breakdown: null }
+        : { total, reason: null, breakdown: breakdownFrom(body) }
     },
 
     async observedTotalFor(chain, network) {
@@ -361,4 +387,62 @@ export function totalFrom(body: unknown): bigint | undefined {
   const total = (body as { total?: unknown }).total
   if (typeof total !== 'string' || !/^(0|[1-9][0-9]*)$/.test(total)) return undefined
   return BigInt(total)
+}
+
+/** At most this many buckets are rendered; see `breakdownFrom`. */
+const MAX_BUCKETS = 8
+/** A prefix longer than this is truncated. `deposit:` is eight characters. */
+const MAX_PREFIX = 24
+
+/**
+ * The breakdown, rendered to prose here and never anywhere else.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * Pure, total, and returns `string | null` — no numeric member, for the reason `Observation.breakdown`
+ * gives at length. It is the sibling of `reasonFor`: one function whose job is to say something an
+ * operator can act on, structurally unable to say anything the arithmetic could use.
+ *
+ * **Everything here is untrusted input that ends up in a database column and on an operator's
+ * screen.** `asset_freezes.reason` is what the console shows first, so a hostile or simply broken
+ * indexer answering with four thousand buckets, or a prefix containing newlines, would be writing
+ * into an incident message. Hence: at most `MAX_BUCKETS` entries, each prefix clamped to
+ * `MAX_PREFIX` characters with everything outside a conservative character class dropped, amounts
+ * accepted only in the same decimal form `totalFrom` demands, and counts only as non-negative safe
+ * integers. Anything that does not fit is not rendered — never repaired, never partially printed
+ * with an ellipsis standing in for a number.
+ *
+ * **A dropped bucket would be a lie by omission**, since the whole claim of the phrase is that the
+ * parts explain the total, so a body with more than `MAX_BUCKETS` buckets is refused entirely
+ * rather than truncated to the first eight. The indexer asserts parts-equal-whole on its own side
+ * (`custody.ts:groupByPrefix`) and this file does not re-derive it: re-deriving would mean summing
+ * these figures, which is exactly the affordance the string type exists to remove.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export function breakdownFrom(body: unknown): string | null {
+  if (typeof body !== 'object' || body === null) return null
+  const buckets = (body as { byLabelPrefix?: unknown }).byLabelPrefix
+  // An indexer too old to send one. Not an error, and not a reason to withhold the total.
+  if (!Array.isArray(buckets) || buckets.length === 0) return null
+  if (buckets.length > MAX_BUCKETS) return null
+
+  const parts: string[] = []
+  for (const bucket of buckets) {
+    if (typeof bucket !== 'object' || bucket === null) return null
+    const { prefix, total, addresses } = bucket as {
+      prefix?: unknown
+      total?: unknown
+      addresses?: unknown
+    }
+    if (typeof prefix !== 'string' || prefix.length === 0) return null
+    if (typeof total !== 'string' || !/^(0|[1-9][0-9]*)$/.test(total)) return null
+    if (typeof addresses !== 'number' || !Number.isSafeInteger(addresses) || addresses < 0) {
+      return null
+    }
+    // The prefix is a configured label like `deposit:`, so this class costs nothing legitimate and
+    // removes every character that could reshape a log line or a console cell.
+    const safe = prefix.replace(/[^A-Za-z0-9:._-]/g, '').slice(0, MAX_PREFIX)
+    if (safe.length === 0) return null
+    parts.push(`${safe} ${total} over ${addresses} address${addresses === 1 ? '' : 'es'}`)
+  }
+  return parts.join(', ')
 }

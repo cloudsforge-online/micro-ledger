@@ -24,7 +24,13 @@ import { createServer as createHttpServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { ON_CHAIN_ASSETS } from '@cloudsforge/contracts-chain'
 import type { LedgerAssetCode } from '@cloudsforge/contracts-money'
-import { INDEXER_SCOPES, httpIndexerClient, indexerChainFor, totalFrom } from './indexerclient.ts'
+import {
+  INDEXER_SCOPES,
+  breakdownFrom,
+  httpIndexerClient,
+  indexerChainFor,
+  totalFrom,
+} from './indexerclient.ts'
 import { isOnChainAsset } from './reconcile.ts'
 
 /* ------------------------------------------------------------------ the parse */
@@ -74,6 +80,88 @@ test('every shape that would NEARLY parse is refused, and none of them becomes 0
     // whole release exists to keep apart and an `assert.equal(x, undefined)` alone does not say so.
     assert.notEqual(result, 0n)
   }
+})
+
+/* ------------------------------------------------------------------ the breakdown, which is prose */
+
+test('the breakdown is rendered to prose, and every figure in it stays a string', () => {
+  assert.equal(
+    breakdownFrom({
+      total: '50000000',
+      byLabelPrefix: [
+        { prefix: 'deposit:', addresses: 12, total: '41000000' },
+        { prefix: 'treasury:', addresses: 1, total: '9000000' },
+      ],
+    }),
+    'deposit: 41000000 over 12 addresses, treasury: 9000000 over 1 address',
+  )
+  // A bucket that matched nothing is printed, because an absent bucket is ambiguous — empty, or the
+  // definition changed? — and that ambiguity would be read during an incident.
+  assert.equal(
+    breakdownFrom({ byLabelPrefix: [{ prefix: 'treasury:', addresses: 0, total: '0' }] }),
+    'treasury: 0 over 0 addresses',
+  )
+})
+
+test('a breakdown this file cannot vouch for is absent, and never a repaired one', () => {
+  // Each of these is a body that would still yield a perfectly good `total`. The split is a
+  // diagnosis: it is dropped whole rather than partially rendered, and dropping it never withholds
+  // the number the solvency check is actually made of.
+  const refused: unknown[] = [
+    // Nothing sent it — an indexer older than this release. Not an error.
+    { total: '7' },
+    { total: '7', byLabelPrefix: [] },
+    { total: '7', byLabelPrefix: 'deposit: 7' },
+    // A JSON number for an amount, which is the same defect `totalFrom` refuses one field up:
+    // `JSON.parse` has already rounded anything above 2^53.
+    { byLabelPrefix: [{ prefix: 'deposit:', addresses: 1, total: 7 }] },
+    { byLabelPrefix: [{ prefix: 'deposit:', addresses: 1, total: '-7' }] },
+    { byLabelPrefix: [{ prefix: 'deposit:', addresses: 1, total: '0x7' }] },
+    { byLabelPrefix: [{ prefix: 'deposit:', addresses: 1.5, total: '7' }] },
+    { byLabelPrefix: [{ prefix: 'deposit:', addresses: -1, total: '7' }] },
+    { byLabelPrefix: [{ prefix: 'deposit:', addresses: '1', total: '7' }] },
+    { byLabelPrefix: [{ prefix: '', addresses: 1, total: '7' }] },
+    { byLabelPrefix: [{ addresses: 1, total: '7' }] },
+    { byLabelPrefix: [null] },
+    // Nine buckets against a bound of eight. REFUSED ENTIRELY rather than truncated to the first
+    // eight: the whole claim of the phrase is that the parts explain the total, and eight of nine
+    // parts under a total is a sentence that reads as a shortfall it is not.
+    {
+      byLabelPrefix: Array.from({ length: 9 }, (_, i) => ({
+        prefix: `p${i}:`,
+        addresses: 0,
+        total: '0',
+      })),
+    },
+    null,
+    'not an object',
+  ]
+  for (const body of refused) {
+    assert.equal(
+      breakdownFrom(body),
+      null,
+      `${JSON.stringify(body) ?? String(body)} produced a breakdown`,
+    )
+  }
+})
+
+test('a prefix cannot reshape the freeze message it is pasted into', () => {
+  // This string travels from another service's JSON into `asset_freezes.reason`, which is what the
+  // console shows an operator first. A newline, an escape sequence, or two hundred characters of
+  // padding would be writing into an incident message.
+  assert.equal(
+    breakdownFrom({
+      byLabelPrefix: [{ prefix: 'dep\nosit:[31m', addresses: 1, total: '7' }],
+    }),
+    'deposit:31m 7 over 1 address',
+  )
+  const long = breakdownFrom({
+    byLabelPrefix: [{ prefix: `d${'e'.repeat(400)}p:`, addresses: 1, total: '7' }],
+  })
+  assert.ok(long !== null && long.length < 60, `unbounded prefix: ${String(long)}`)
+  // A prefix made ENTIRELY of characters that do not survive the filter leaves nothing to name the
+  // bucket with, and an unnamed bucket in a breakdown is worse than no breakdown.
+  assert.equal(breakdownFrom({ byLabelPrefix: [{ prefix: '\n\n', addresses: 1, total: '7' }] }), null)
 })
 
 /* ------------------------------------------------------------------ the status rule */
