@@ -58,7 +58,8 @@ import assert from 'node:assert/strict'
 import { createServer as createHttpServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { existsSync } from 'node:fs'
-import { fileURLToPath } from 'node:url'
+import { createRequire } from 'node:module'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import type postgres from 'postgres'
 import { JobQueue, JobRunner } from '@cloudsforge/jobs'
 import { Logger, Metrics } from '@cloudsforge/telemetry'
@@ -283,6 +284,41 @@ interface IndexerMetricsModule {
   registerServiceMetrics(metrics: unknown): unknown
 }
 
+/**
+ * `micro-indexer`'s OWN `@cloudsforge/auth`, and the reason it cannot be this repository's.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * `statusFor` — the one function in the estate that decides what an auth failure means — is written
+ * as `err instanceof TokenError`, which is correct inside a container, where the service and the
+ * package it authenticates with are one module graph. **This file is not inside that container.**
+ * It runs `micro-ledger`'s tests and dynamically imports `micro-indexer`'s source from a sibling
+ * checkout, and pnpm has materialised `@cloudsforge/auth` — a `file:` dependency on
+ * `runtime/packages/auth` — into each checkout's own store as a separate physical copy. Two paths,
+ * two evaluations, two `TokenError` classes that are structurally identical and `instanceof`-blind
+ * to one another.
+ *
+ * So a stub verifier throwing THIS repository's `TokenError` produced 500 at the indexer's route,
+ * not 401: `statusFor` returned `null`, the error fell through to the generic handler, and the run
+ * recorded `indexer_error` — a fact about a cross-checkout module identity, dressed as a fact about
+ * the indexer. The test that asserted `unauthorized` had never passed on a developer's machine, and
+ * could not: it was skipped in CI, where `INDEXER_TEST_DATABASE_URL` is unset. micro-org#255.
+ *
+ * Resolving the specifier from the indexer's own root gives the class its `statusFor` will
+ * recognise. Nothing about the product changes; this is the harness paying the cost of testing
+ * across two checkouts rather than hiding it.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+async function indexerTokenError(): Promise<new (message: string, reason: string) => Error> {
+  const require = createRequire(fileURLToPath(new URL('server.ts', INDEXER_SRC)))
+  const auth = (await import(pathToFileURL(require.resolve('@cloudsforge/auth')).href)) as {
+    TokenError?: new (message: string, reason: string) => Error
+  }
+  if (auth.TokenError === undefined) {
+    throw new Error("micro-indexer's @cloudsforge/auth no longer exports TokenError")
+  }
+  return auth.TokenError
+}
+
 async function indexerModule<T>(file: string, exports: readonly string[]): Promise<T> {
   const loaded = (await import(new URL(file, INDEXER_SRC).href)) as Record<string, unknown>
   for (const name of exports) {
@@ -364,6 +400,7 @@ function startNode(): Promise<string> {
 }
 
 async function startLiveIndexer(): Promise<void> {
+  const TokenErrorClass = await indexerTokenError()
   const server = await indexerModule<IndexerServerModule>('server.ts', ['createServer'])
   const custody = await indexerModule<IndexerCustodyModule>('custody.ts', ['rpcCustodyObserver'])
   const rpc = await indexerModule<IndexerRpcModule>('rpc.ts', ['RpcPool'])
@@ -413,7 +450,13 @@ async function startLiveIndexer(): Promise<void> {
     verifier: {
       async principal(token: string) {
         if (token === TOKEN) return { kind: 'service', service: 'ledger', scopes: ['indexer:read'] }
-        throw new Error('unknown token')
+        // **A `TokenError`, not a bare `Error`, and the indexer's own — see `indexerTokenError`.**
+        // The route maps a rejected token to 401 and a verifier that BLEW UP to 503, which are two
+        // different facts: one about the caller's credential, one about identity being down. A stub
+        // throwing anything `statusFor` does not recognise produces the second, and the 401 case
+        // below then asserts against a 500. The real `Verifier` throws this for an unverifiable
+        // token; `indexer/src/server.test.ts` drives the same seam against the real one.
+        throw new TokenErrorClass('unknown token', 'invalid')
       },
     },
     reads: new Proxy({}, { get: () => () => { throw new Error('custody route only') } }),
@@ -789,4 +832,33 @@ test('LIVE — the confirmed depth is real: a balance is read below the head, no
   assert.equal(observation.requiredConfirmations, CONFIRMATIONS)
   assert.equal(observation.observedAtBlock, HEAD - CONFIRMATIONS + 1)
   assert.equal((await lastRun()).observed_source, 'indexer')
+})
+
+test('LIVE — the freeze names WHERE the observed side sits, end to end', { skip: liveSkip }, async () => {
+  // Step 5 of micro-org#248, through every real component in the loop: the indexer's own
+  // `groupByPrefix` splits the set it summed, the route serialises it, `breakdownFrom` renders it
+  // to prose, and `reconcileAsset` writes it into the column an operator reads first. Nothing here
+  // is a double, which is what makes it evidence rather than agreement between two fixtures.
+  node.balances.set(CUSTODY_ADDRESSES[0]!, 4n * ONE)
+  node.balances.set(CUSTODY_ADDRESSES[1]!, 3n * ONE)
+  await credit(10n * ONE)
+
+  await runReconcileJob(liveClient())
+
+  const row = await lastRun()
+  assert.equal(row.status, 'drift_exceeded')
+  assert.equal(row.drift, (3n * ONE).toString())
+
+  // Both live custody addresses carry `deposit:` labels, so the drift is entirely in deposits and
+  // the treasury bucket is a reported zero rather than an absent one. An operator reading this
+  // knows which of two services to look at before they open a second window.
+  const [freeze] = await sql<{ reason: string }[]>`
+    select reason from asset_freezes where asset_code = 'EMBER'
+  `
+  assert.equal(
+    freeze?.reason,
+    'reconciliation drift_exceeded: drift 3000000000000000000 ' +
+      '(custody 10000000000000000000, observed 7000000000000000000 = ' +
+      'deposit: 7000000000000000000 over 2 addresses, treasury: 0 over 0 addresses)',
+  )
 })

@@ -379,6 +379,73 @@ test('an indexer-supplied total is compared and labelled as such', { skip }, asy
   assert.equal(result.status, 'drift_exceeded')
 })
 
+test('the drift freeze names WHERE the observed side sits, when the observer said', { skip }, async () => {
+  // Step 5 of micro-org#248. "drift 100" says the estate and the chain disagree; it does not say
+  // whether users' deposits are short or the platform's own float is, which are different incidents
+  // with different code behind them. The clause is APPENDED, so the arithmetic an operator can
+  // check reads exactly as it did before this change and the reported split follows it.
+  await post(depositEntry({ amount: 5_000n, assetCode: 'EMBER' }))
+  const result = await reconcileAsset(db(), {
+    producer: 'ledger',
+    assetCode: 'EMBER',
+    chain: 'Hearth',
+    network: 'testnet',
+    tolerance: {},
+    indexerObservedTotal: 4_900n,
+    observedBreakdown: 'deposit: 4000 over 12 addresses, treasury: 900 over 1 address',
+  })
+
+  const [freeze] = await listFreezes(db())
+  assert.equal(freeze?.runId, result.id)
+  assert.equal(
+    freeze?.reason,
+    'reconciliation drift_exceeded: drift 100 (custody 5000, observed 4900 = ' +
+      'deposit: 4000 over 12 addresses, treasury: 900 over 1 address)',
+  )
+  // And the arithmetic itself is untouched by it: the breakdown is prose in one column and reaches
+  // neither the drift, the status, nor the run row.
+  assert.equal(result.drift, '100')
+  assert.equal(result.status, 'drift_exceeded')
+})
+
+test('no breakdown means no clause, because an empty split would be a claim about the chain', { skip }, async () => {
+  // An indexer older than this release sends no split. The freeze must read as it always did rather
+  // than trailing an `=` with nothing after it, which an operator would read as "the chain holds
+  // nothing anywhere" — a measurement, where the truth is that nobody reported one.
+  await post(depositEntry({ amount: 5_000n, assetCode: 'EMBER' }))
+  await reconcileAsset(db(), {
+    producer: 'ledger',
+    assetCode: 'EMBER',
+    chain: 'Hearth',
+    network: 'testnet',
+    tolerance: {},
+    indexerObservedTotal: 4_900n,
+  })
+  const [freeze] = await listFreezes(db())
+  assert.equal(freeze?.reason, 'reconciliation drift_exceeded: drift 100 (custody 5000, observed 4900)')
+})
+
+test('a breakdown longer than a freeze message is clamped, and says that it was', { skip }, async () => {
+  // The second clamp, on a value the client has already bounded. `reconcileAsset` is callable by
+  // more than the HTTP client, and "a freeze reason is a bounded string" should be true of every
+  // caller rather than of one producer.
+  await post(depositEntry({ amount: 5_000n, assetCode: 'EMBER' }))
+  await reconcileAsset(db(), {
+    producer: 'ledger',
+    assetCode: 'EMBER',
+    chain: 'Hearth',
+    network: 'testnet',
+    tolerance: {},
+    indexerObservedTotal: 4_900n,
+    observedBreakdown: 'x'.repeat(5_000),
+  })
+  const [freeze] = await listFreezes(db())
+  assert.ok(freeze !== undefined && freeze.reason.length < 400, `unbounded reason`)
+  assert.match(freeze.reason, /…\)$/)
+  // The arithmetic still precedes it and is still readable, which is the point of appending.
+  assert.match(freeze.reason, /^reconciliation drift_exceeded: drift 100 \(custody 5000, observed 4900 = x/)
+})
+
 /**
  * **The seductive case, and the one this test used to get wrong.**
  *
