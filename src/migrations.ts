@@ -1057,6 +1057,79 @@ export const MIGRATIONS: readonly Migration[] = [
       on conflict (asset_code) do nothing;
     `,
   },
+
+  {
+    version: 15,
+    name: 'dogecoin_and_classic_chain_assets',
+    up: `
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+      -- DOGE AND ETC JOIN THE ASSETS THIS LEDGER MAY NOT ATTEST TO BY ITSELF.
+      --
+      -- Two rows, one migration, appended rather than added to 11 or 14 for the reason 11 gave and
+      -- 14 acted on: migration text is CHECKSUMMED (@cloudsforge/db, checksumOf), so editing an
+      -- applied one is not a diff, it is every deployment refusing to start. A new chain asset is
+      -- a new version, and this is the version for the two contracts-chain added on 2026-08-08.
+      --
+      -- Both go in one migration because they arrived in one contracts release and because the
+      -- guard they feed is set-valued: 'reconcile.test.ts' asserts this table equals
+      -- ON_CHAIN_ASSETS, so a migration that added one of the two would leave that assertion RED
+      -- and the next reader unable to tell an unfinished change from a broken one.
+      --
+      -- ── WHAT THESE ROWS TURN ON, AND WHAT THEY DO NOT ────────────────────────────────────────
+      --
+      -- Membership makes 'observed_source' = 'liability_sum' ILLEGAL for these two codes (the
+      -- INVARIANT 6 trigger, migration 11), and forces a run that observed nothing to record
+      -- 'unavailable', a NULL total, a NULL drift and status 'failed'. That is the whole effect:
+      -- it says HOW a DOGE or ETC reconciliation must be answered if one is ever asked for.
+      --
+      -- It does not ask for one. WHICH assets are swept is 'LEDGER_RECONCILE_ASSETS', which this
+      -- service defaults to "SHARD,EMBER" and which the estate sets explicitly; BTC, ETH, SOL and
+      -- XRP have sat in this table unswept since migration 11 and LTC since 14. DOGE and ETC join
+      -- them on exactly that footing.
+      --
+      -- ── WHY NEITHER MAY BE ADDED TO THAT VARIABLE YET, WHICH IS THE POINT OF THIS PARAGRAPH ──
+      --
+      -- THE ESTATE HAS NO DOGECOIN NODE AND NO ETHEREUM CLASSIC NODE. contracts-chain records it
+      -- of both: INDEXER_CHAINS follows neither, and no DOGE or ETC deposit has ever been credited
+      -- at any depth. So a sweep named for either would reach 'observedTotalFor', get no answer,
+      -- and record 'unavailable'/'failed' — which writes an 'asset_freezes' row.
+      --
+      -- That row is not undone by undoing the edit. Only an exactly-clean OBSERVED run lifts a
+      -- freeze, and an unobservable asset cannot produce one, so removing the name from
+      -- 'LEDGER_RECONCILE_ASSETS' afterwards leaves the freeze standing. Naming an asset there
+      -- that this build cannot observe is therefore a one-way action, and the order it has to be
+      -- done in is: indexer feed first, then the variable. This migration is deliberately only the
+      -- first half — the schema is made ready and nothing is switched on.
+      --
+      -- 'on conflict do nothing' for migration 11's reason: a migration must survive being re-run
+      -- against a database that already has the row, and a duplicate key here is an outage.
+      --
+      -- Tolerance is not a column and is not set here. It is 'LEDGER_ASSET_TOLERANCE', absent
+      -- means zero, and 'withinTolerance' fails closed — so nothing needs doing for these two to
+      -- be at zero. The day either is genuinely swept the bound is a decision rather than a
+      -- default, and the two do not have the same one: DOGE is LTC's argument unchanged (an
+      -- 8-decimal UTXO chain, integer outputs against integer postings, no rounding on either
+      -- side, so any drift is real), while ETC is EMBER's question (18 decimals with fees in
+      -- flight) and must be answered on ETC's own numbers rather than by copying EMBER's.
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+
+      insert into chain_assets (asset_code, note) values
+        ('DOGE',
+         'Dogecoin. Bitcoin family in contracts-chain, so micro-indexer would follow it with the ' ||
+         'bitcoin worker — but it has no bech32 and no segwit, its addresses are base58 only, and ' ||
+         'nothing in this estate follows it today. Confirmations are 30, derived from a measured ' ||
+         '63.40s mean block time rather than copied from Litecoin''s 12. Not in ' ||
+         'LEDGER_RECONCILE_ASSETS: there is no node to observe it, and a named unobservable asset ' ||
+         'freezes permanently.'),
+        ('ETC',
+         'Ethereum Classic. EVM family, chain id 61 mainnet and 63 Mordor. Pre-London: no base ' ||
+         'fee and no maxFeePerGas, so a settlement fee booked at plan time is exact for it. ' ||
+         'Confirmations are 7,500 — ~28 hours — against a documented history of deep 51% ' ||
+         'reorganisations. Not in LEDGER_RECONCILE_ASSETS, and for the same reason as DOGE: ' ||
+         'nothing observes it, and a sweep of an unobservable asset freezes it for good.')
+      on conflict (asset_code) do nothing;
+    `,
+  },
 ]
 
 /**

@@ -160,11 +160,16 @@ maximum version in that list, and `index.ts` asserts it at boot and refuses to s
 retype it, which is precisely what this sentence did — it read "1–11" for three migrations after
 that stopped being true, while the schema the service actually demanded had moved on.
 
-`chain_assets` is reference data, not state: the five codes in `ON_CHAIN_ASSETS`
+`chain_assets` is reference data, not state: the codes in `ON_CHAIN_ASSETS`
 (`contracts/packages/chain/src/index.ts`), seeded by migration 11 so that a constraint can read
 them — a `CHECK` cannot reference another table, and interpolating the list into the migration text
-would change an **applied** migration's checksum the day a sixth asset is added and stop every
-deployment booting. `reconcile.test.ts` asserts the table equals `ON_CHAIN_ASSETS`, and
+would change an **applied** migration's checksum the day another asset is added and stop every
+deployment booting. That day has now come twice: LTC arrived as migration 14, and DOGE and ETC as
+migration 15, each an `insert … on conflict do nothing` and none of them an edit. The count is left
+out of this sentence on purpose, for the reason the paragraph above gives about version ranges — it
+read "five" through the release that made it six. `reconcile.test.ts` asserts the table equals
+`ON_CHAIN_ASSETS`, `migrations.test.ts` asserts the same thing against the migration text where
+there is no database to read, and
 `testsupport.ts` deliberately excludes it from the truncate list — emptying it would silently
 disarm the guard below and turn the whole suite green.
 
