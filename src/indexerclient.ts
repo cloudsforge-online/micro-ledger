@@ -236,6 +236,13 @@ export type UnobservedReason = (typeof UNOBSERVED_REASONS)[number]
 export const UNOBSERVED_PERSISTENCE: Record<UnobservedReason, 'transient' | 'structural'> =
   Object.freeze({
     not_configured: 'structural',
+    // `no_credential` is a member of the fixed `UnobservedReason` union above and appears here as a
+    // KEY; the literal beside it is one of the two words this map may contain, and
+    // `reconcile.test.ts` checks that exhaustively against `UNOBSERVED_REASONS`. The name is for the
+    // ABSENCE of a credential — the one thing a secret cannot be — so the scanner's finding is a
+    // true match on a name and a false one on a value. Kept as the marker rather than renamed: the
+    // reason is a stored column value and migration 12 back-filled history with it.
+    // secret-hygiene: allow the key names an unobserved reason, and the value is one of two fixed words
     no_credential: 'transient',
     unauthorized: 'transient',
     timeout: 'transient',
