@@ -106,6 +106,10 @@ function jobDeps(indexer: IndexerClient | undefined): JobDeps {
     reconcileNetwork: 'testnet',
     indexer,
     idempotencyTtlDays: 30,
+    // micro-org#275 gives a transient absence ONE retry before it counts as a run. Production waits
+    // 1.5s; here the wait is real but negligible, so what the cases below prove is that the retry
+    // fires (and that it does not, for a structural reason) rather than how long it sleeps for.
+    unobservedRetryDelayMs: 5,
   }
 }
 
@@ -610,8 +614,14 @@ test('SHARD has no chain, so the job asks nobody and records liability_sum', { s
  * exactly how a 401 from an expired credential and a 503 from an unfollowed chain came to be the
  * same row for the life of the service. A helper that let a case skip the reason would let that
  * back in one case at a time.
+ *
+ * `freezes` is likewise required, for the same reason one step later. Since micro-org#275 the four
+ * columns above no longer settle whether withdrawals stopped: a STRUCTURAL absence still freezes on
+ * the first run, a TRANSIENT one is deferred to the next. The recorded row is byte-identical in
+ * both cases, so a helper that assumed the freeze would report both halves of the change as passing
+ * whichever half it happened to be wrong about.
  */
-async function assertUnobservedFailure(expected: string): Promise<void> {
+async function assertUnobservedFailure(expected: string, freezes: boolean): Promise<void> {
   const row = await lastRun()
   assert.equal(row.observed_source, 'unavailable', 'an unobservable indexer produced an observation')
   assert.equal(row.status, 'failed')
@@ -619,7 +629,11 @@ async function assertUnobservedFailure(expected: string): Promise<void> {
   assert.equal(row.indexer_observed_total, null)
   assert.equal(row.drift, null)
   assert.equal(row.unobserved_reason, expected, 'the run did not record WHY it could not observe')
-  assert.equal(await frozen(), true)
+  assert.equal(
+    await frozen(),
+    freezes,
+    freezes ? 'the asset should be frozen and is not' : 'the asset was frozen when it should not be',
+  )
 }
 
 test('BREAK 1 — an unreachable indexer freezes the asset; the job never sees a 0n', { skip }, async () => {
@@ -632,26 +646,45 @@ test('BREAK 1 — an unreachable indexer freezes the asset; the job never sees a
     token: () => TOKEN,
     deadlineMs: 1_000,
   })
+
+  // micro-org#275: a network fault is TRANSIENT, so the first sweep does not stop withdrawals — it
+  // records that it could not look. `unreachable`, not `indexer_error`: nothing on the far end
+  // answered at all. Migration 12 makes the run say which, so this is not confused with the
+  // estate's honest `chain_not_followed`.
   await runReconcileJob(dead)
-  // `unreachable`, not `indexer_error`: nothing on the far end answered at all. Migration 12 makes
-  // the run say which, so this freeze is not confused with the estate's honest `chain_not_followed`.
-  await assertUnobservedFailure('unreachable')
+  await assertUnobservedFailure('unreachable', false)
+
+  // Fifteen minutes later and the far end is still not there. That is no longer a restart window,
+  // and the guarantee this file exists for reasserts itself: an asset whose backing nobody can see
+  // is an asset nobody can withdraw.
+  await runReconcileJob(dead)
+  await assertUnobservedFailure('unreachable', true)
+  assert.equal(await runCount(), 2, 'the deferral must record a run, not skip one')
 })
 
 test('BREAK 2 — a stalled indexer ends at the DEADLINE and does not hold the job lease open', { skip }, async () => {
   await credit(7n * ONE)
   upstream.stall = true
+  const stalled = httpIndexerClient({ baseUrl: fixtureBase, token: () => TOKEN, deadlineMs: 250 })
   const startedAt = Date.now()
-  await runReconcileJob(
-    httpIndexerClient({ baseUrl: fixtureBase, token: () => TOKEN, deadlineMs: 250 }),
-  )
+  await runReconcileJob(stalled)
   const elapsed = Date.now() - startedAt
-  await assertUnobservedFailure('timeout')
-  // The ceiling is real and it is absolute, not per-attempt. Without one, a provider holding the
-  // socket open holds this asset's lease with it and the next sweep cannot be claimed.
+  await assertUnobservedFailure('timeout', false)
+
+  // **The retry is the job's, not the client's.** `indexerclient.ts` still sends exactly one HTTP
+  // call per `observe` and still has `retries: 0`; micro-org#275 asks for a single second look, and
+  // the handler that owns the lease is the only place that can decide to spend it. Two requests
+  // reached the fixture, so the retry is real rather than a variable nobody reads.
+  assert.equal(upstream.requests, 2, 'a transient absence was not retried once')
+
+  // The ceiling is real and it is absolute, not per-attempt — and it survived gaining an attempt.
+  // Without one, a provider holding the socket open holds this asset's lease with it and the next
+  // sweep cannot be claimed. Two 250ms deadlines and a 5ms wait are nowhere near this bound; a
+  // retry that inherited no deadline, or a loop rather than one extra look, would blow it.
   assert.ok(elapsed < 5_000, `the deadline did not bound the call (${elapsed}ms)`)
-  // And it did not retry: a retry inside a leased handler spends the lease on an outage.
-  assert.equal(upstream.requests, 1)
+
+  await runReconcileJob(stalled)
+  await assertUnobservedFailure('timeout', true)
 })
 
 test('BREAK 3 — no credential is a 401, which is a freeze and never a number', { skip }, async () => {
@@ -659,14 +692,23 @@ test('BREAK 3 — no credential is a 401, which is a freeze and never a number',
   // The state this deployment is in until `derive-grants.mjs` has read `INDEXER_SCOPES` and
   // micro-deploy has regenerated `IDENTITY_SERVICE_TOKEN_GRANTS`. A deploy mistake must stop
   // withdrawals, not report a total.
+  //
+  // It is also the shape of the incident micro-org#275 was filed for: restarting `identity` makes
+  // this platform briefly unable to present a credential, and the sweep inside that window is
+  // seconds wide. So the first run defers, and the retry — a second look after `identity` has come
+  // back — is what usually ends it.
   await runReconcileJob(fixtureClient(null))
-  assert.equal(upstream.requests, 1)
-  assert.equal(upstream.authorizations[0], null)
+  assert.equal(upstream.requests, 2, 'the retry did not fire, so a restart window still freezes')
+  assert.deepEqual(upstream.authorizations, [null, null], 'the retry invented a credential')
   // `unauthorized` — the indexer refused what was presented, which is a GRANT problem. It is a
   // different row from `no_credential`, which is what `upstreams.ts` records when this container
   // holds no credential at all and the call is therefore never sent. Those have different remedies
   // (`derive-grants.mjs` against `estate-bootstrap.sh`) and, until migration 12, one row.
-  await assertUnobservedFailure('unauthorized')
+  await assertUnobservedFailure('unauthorized', false)
+
+  // A grant that is genuinely missing does not repair itself, and the second sweep freezes.
+  await runReconcileJob(fixtureClient(null))
+  await assertUnobservedFailure('unauthorized', true)
 })
 
 test('BREAK 4 — a 503 with a fault code is a refusal, not a fallback signal', { skip }, async () => {
@@ -678,7 +720,13 @@ test('BREAK 4 — a 503 with a fault code is a refusal, not a fallback signal', 
   await runReconcileJob(fixtureClient())
   // **THE EXPECTED FREEZE.** This is the one an operator must be able to leave alone, and every
   // other break in this file must be distinguishable from it.
-  await assertUnobservedFailure('indexer_error')
+  //
+  // micro-org#275 does NOT reach it. An indexer that answers "I do not follow this chain" is
+  // STRUCTURAL: it answered, the answer will not change on a second look, and waiting a sweep for
+  // it would be fifteen minutes of withdrawals against a chain nobody is watching. So the freeze is
+  // on the first run, as it always was, and no retry was spent finding that out.
+  await assertUnobservedFailure('indexer_error', true)
+  assert.equal(upstream.requests, 1, 'a structural refusal was retried as though it were a blip')
 })
 
 test('BREAK 5 — a 200 whose body is not a total, in every shape that would nearly parse', { skip }, async () => {
@@ -770,7 +818,10 @@ test('BREAK 8 — a deployment with no INDEXER_URL freezes rather than falling b
   // `deps.indexer` is `undefined`, which is what `index.ts` builds when the variable is unset. The
   // optional chain in the handler must not become an absence that reads as "check not required".
   await runReconcileJob(undefined)
-  await assertUnobservedFailure('not_configured')
+  // STRUCTURAL, so it freezes on the first run. An unset variable is not a blip: no second sweep is
+  // going to set it, and micro-org#275's deferral would have turned this deliberate freeze into
+  // fifteen minutes of open withdrawals on every misconfigured deploy.
+  await assertUnobservedFailure('not_configured', true)
   assert.equal(await runCount(), 1)
 })
 
@@ -805,16 +856,21 @@ test('LIVE — one unreadable address withholds the whole total, and the job rec
   // and positive drift freezes on the strength of one RPC failure while asserting a number that
   // was never true. The indexer refuses; the ledger records that nobody looked, and that the
   // refusal came from the INDEXER rather than from this service's credentials.
-  await assertUnobservedFailure('indexer_error')
+  await assertUnobservedFailure('indexer_error', true)
 })
 
 test('LIVE — a token without indexer:read is a 401, and the whole loop fails closed on it', { skip: liveSkip }, async () => {
   node.balances.set(CUSTODY_ADDRESSES[0]!, 7n * ONE)
   await credit(7n * ONE)
 
+  // TRANSIENT: a 401 is what a restarting `identity` also produces, and micro-org#275 will not tell
+  // the two apart from one answer. So the first run defers and the second decides — against the
+  // real indexer, over real HTTP, with a token the real route really rejects.
   await runReconcileJob(liveClient('not-the-service-token'))
+  await assertUnobservedFailure('unauthorized', false)
 
-  await assertUnobservedFailure('unauthorized')
+  await runReconcileJob(liveClient('not-the-service-token'))
+  await assertUnobservedFailure('unauthorized', true)
 })
 
 test('LIVE — the confirmed depth is real: a balance is read below the head, not at it', { skip: liveSkip }, async () => {

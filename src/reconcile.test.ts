@@ -20,8 +20,19 @@ import assert from 'node:assert/strict'
 import type postgres from 'postgres'
 import { AssetFrozenError, postEntry, type PostEntryDeps } from './entries.ts'
 import { requestFingerprint } from './idempotency.ts'
-import { RECONCILIATION_COMPLETED, listFreezes, latestRuns, reconcileAsset } from './reconcile.ts'
-import { UNOBSERVED_REASONS } from './indexerclient.ts'
+import {
+  RECONCILIATION_COMPLETED,
+  UNOBSERVED_RUNS_BEFORE_FREEZE,
+  listFreezes,
+  latestRuns,
+  reconcileAsset,
+} from './reconcile.ts'
+import {
+  UNOBSERVED_PERSISTENCE,
+  UNOBSERVED_REASONS,
+  isTransientUnobserved,
+  type UnobservedReason,
+} from './indexerclient.ts'
 import { topicSpec } from '@cloudsforge/contracts-events'
 import { ON_CHAIN_ASSETS } from '@cloudsforge/contracts-chain'
 import { KEYED_BY, envelopeDefects } from './topics.ts'
@@ -46,8 +57,27 @@ const deps = (): PostEntryDeps => ({ sql: db(), producer: 'ledger' })
 const post = (request: Parameters<typeof postEntry>[1]) =>
   postEntry(deps(), request, requestFingerprint(request as unknown))
 
-const run = (assetCode: 'SHARD' | 'EMBER', tolerance: Record<string, bigint> = {}) =>
-  reconcileAsset(db(), { assetCode, chain: 'platform', network: 'testnet', tolerance, producer: 'ledger' })
+/**
+ * `unobservedReason` is explicit wherever an unobserved run's FREEZE is the subject.
+ *
+ * Since micro-org#275 the reason decides when the freeze is written: a structural one freezes on
+ * the first run, a transient one after `UNOBSERVED_RUNS_BEFORE_FREEZE` in a row. Omitting it falls
+ * back to `unreachable`, which is transient — so a case that means "this freezes" and does not say
+ * why it could not observe is a case asserting the opposite of what it reads as.
+ */
+const run = (
+  assetCode: 'SHARD' | 'EMBER',
+  tolerance: Record<string, bigint> = {},
+  unobservedReason?: UnobservedReason,
+) =>
+  reconcileAsset(db(), {
+    assetCode,
+    chain: 'platform',
+    network: 'testnet',
+    tolerance,
+    producer: 'ledger',
+    ...(unobservedReason ? { unobservedReason } : {}),
+  })
 
 /**
  * An opening SHARD balance: custody up, the user's liability up, by the same amount.
@@ -183,7 +213,13 @@ test('THE DEFECT: a deposit that never happened on chain reconciles CLEAN with n
   // froze false — a green run over 5000 EMBER of thin air. AFTER it, the absence of an indexer
   // reading is itself the finding: no observation, no drift number, `failed`, and the asset stays
   // frozen. Absence of evidence must not read as evidence.
-  const unobserved = await run('EMBER')
+  //
+  // The reason is NAMED since micro-org#275, and naming it is what keeps this case asserting what
+  // it was written to assert. `indexer_error` is the estate's own honest answer for a chain nobody
+  // follows — `chain_not_followed`, a 503 — and it is structural, so it freezes on the first run
+  // exactly as every unobserved run used to. A transient reason is now deferred instead, which is
+  // a different claim and is proved separately below.
+  const unobserved = await run('EMBER', {}, 'indexer_error')
 
   assert.equal(unobserved.observedSource, 'unavailable')
   assert.equal(unobserved.indexerObservedTotal, null, 'an unknown must be recorded as unknown, never as 0')
@@ -491,6 +527,272 @@ test('a PLATFORM asset with no accounts still reconciles clean at zero', { skip 
   assert.equal(result.observedSource, 'liability_sum')
   assert.equal(result.ledgerCustodyTotal, '0')
   assert.equal(result.drift, '0')
+})
+
+/* ══════════════════════════════════════════════════════════════════════════════════════════════
+ * micro-org#275 — A ROLLING RESTART MUST NOT FREEZE A HEALTHY ASSET
+ *
+ * Restarting `indexer` and `identity` on mainnet at 2026-08-08 23:23 UTC put the EMBER sweep
+ * inside the window at 23:23:28. It could not mint a service token, recorded `no_credential`, and
+ * froze an asset nothing was wrong with; the 23:38:29 sweep was clean and lifted it. Fifteen
+ * minutes of refused withdrawals, caused by maintenance, and repeatable on any deploy that touches
+ * identity — which is most of them.
+ *
+ * Every case below is about WHEN a verdict is reached. **Not one of them relaxes what is compared:**
+ * an unobserved run still records a NULL total, a NULL drift and `failed`, still cannot be clean,
+ * and still cannot lift a freeze. That is asserted in each case rather than assumed, because the
+ * way this change could go wrong is by buying quiet with a number nobody measured.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════ */
+
+/** What must be true of every deferred run, so no case below can quietly assert less. */
+function assertStillUnobserved(result: Awaited<ReturnType<typeof run>>): void {
+  assert.equal(result.observedSource, 'unavailable')
+  assert.equal(result.status, 'failed', 'a run that observed nothing may never be clean')
+  assert.equal(result.indexerObservedTotal, null, 'nothing is not zero')
+  assert.equal(result.drift, null, 'there is no drift without two numbers to subtract')
+  assert.equal(result.unfroze, false, 'an unobserved run may never lift a freeze')
+}
+
+test('a TRANSIENT absence does not freeze on the first run — a restart is not an insolvency', { skip }, async () => {
+  await post(depositEntry({ amount: 5_000n, assetCode: 'EMBER' }))
+
+  // The exact row mainnet wrote at 23:23:28. Nothing is known about EMBER's backing in either
+  // direction, and the state of the world a moment earlier — clean, drift 0 — is unchanged.
+  const result = await run('EMBER', {}, 'no_credential')
+
+  assertStillUnobserved(result)
+  assert.equal(result.froze, false, 'a single restart window froze a healthy asset')
+  assert.equal(result.freezeDeferred, true)
+  assert.equal(result.unobservedRuns, 1)
+  assert.deepEqual(await listFreezes(db()), [], 'withdrawals must still be open')
+})
+
+test('a TRANSIENT absence that persists freezes on the next run — the guarantee still holds', { skip }, async () => {
+  await post(depositEntry({ amount: 5_000n, assetCode: 'EMBER' }))
+
+  const deferred = await run('EMBER', {}, 'no_credential')
+  assert.equal(deferred.froze, false)
+
+  // Fifteen minutes later and still nobody can look. That is no longer a deploy window, it is an
+  // observer that is broken, and an asset whose backing nobody can see is an asset nobody should
+  // be able to withdraw.
+  const frozen = await run('EMBER', {}, 'no_credential')
+
+  assertStillUnobserved(frozen)
+  assert.equal(frozen.unobservedRuns, UNOBSERVED_RUNS_BEFORE_FREEZE)
+  assert.equal(frozen.freezeDeferred, false)
+  assert.equal(frozen.froze, true)
+  const [freeze] = await listFreezes(db())
+  assert.ok(freeze, 'a persistent absence must still freeze')
+  assert.match(freeze.reason, /no indexer observation/)
+  // The freeze still refuses to imply a zero, and still names its own cause.
+  assert.match(freeze.reason, /chain holdings UNKNOWN, not zero/)
+  assert.match(freeze.reason, /reason no_credential/)
+})
+
+test('a STRUCTURAL absence freezes on the FIRST run — the deploy trap must keep working', { skip }, async () => {
+  await post(depositEntry({ amount: 5_000n, assetCode: 'EMBER' }))
+
+  // `not_configured` is a deployment with no INDEXER_URL: nothing was dialled, and waiting will not
+  // dial it. The deploy compose comments document this freeze deliberately, and micro-org#275 asks
+  // for it to keep firing promptly while the transient reasons stop doing so.
+  const result = await run('EMBER', {}, 'not_configured')
+
+  assertStillUnobserved(result)
+  assert.equal(result.freezeDeferred, false)
+  assert.equal(result.froze, true, 'a structural absence was deferred like a blip')
+  assert.equal(result.unobservedRuns, 1, 'it froze on the first run, not after a wait')
+})
+
+test('an observed run RESETS the count, so two blips a week apart never freeze', { skip }, async () => {
+  await post(depositEntry({ amount: 5_000n, assetCode: 'EMBER' }))
+
+  assert.equal((await run('EMBER', {}, 'unreachable')).freezeDeferred, true)
+
+  // A real reading of a real chain, agreeing exactly. The estate is demonstrably solvent at this
+  // moment, so the previous failure is spent evidence and must not be carried forward.
+  const observed = await reconcileAsset(db(), {
+    producer: 'ledger',
+    assetCode: 'EMBER',
+    chain: 'Hearth',
+    network: 'testnet',
+    tolerance: {},
+    indexerObservedTotal: 5_000n,
+  })
+  assert.equal(observed.status, 'clean')
+  assert.equal(observed.unobservedRuns, null, 'a run that observed has no absence to count')
+  assert.equal(observed.freezeDeferred, false)
+
+  const second = await run('EMBER', {}, 'unreachable')
+  assert.equal(second.unobservedRuns, 1, 'the count must be CONSECUTIVE, not cumulative')
+  assert.equal(second.freezeDeferred, true)
+  assert.deepEqual(await listFreezes(db()), [])
+})
+
+test('a deferred run leaves an existing freeze exactly as it found it', { skip }, async () => {
+  await post(depositEntry({ amount: 5_000n, assetCode: 'EMBER' }))
+
+  // A measured drift. This freezes on the first run and always has — deferral is about absence,
+  // never about arithmetic somebody actually did.
+  const drifted = await reconcileAsset(db(), {
+    producer: 'ledger',
+    assetCode: 'EMBER',
+    chain: 'Hearth',
+    network: 'testnet',
+    tolerance: {},
+    indexerObservedTotal: 4_000n,
+  })
+  assert.equal(drifted.froze, true)
+  assert.equal(drifted.freezeDeferred, false, 'a drift is never deferred')
+  const before = (await listFreezes(db()))[0]!
+
+  const deferred = await run('EMBER', {}, 'timeout')
+  assert.equal(deferred.freezeDeferred, true)
+
+  const after = (await listFreezes(db()))[0]!
+  assert.equal(after.reason, before.reason, 'a blip overwrote the arithmetic of a real freeze')
+  assert.equal(after.runId, before.runId)
+  assert.match(after.reason, /drift 1000/, 'the operator must still see the number they can check')
+  // The asset is still frozen. Nothing about deferral reopens a withdrawal path.
+  assert.equal((await listFreezes(db())).length, 1)
+})
+
+test('the deferred state is ON THE WIRE, not left to a consumer to infer', { skip }, async () => {
+  await post(depositEntry({ amount: 5_000n, assetCode: 'EMBER' }))
+  const result = await run('EMBER', {}, 'no_credential')
+
+  const row = (await outboxRows(RECONCILIATION_COMPLETED))[0]!
+  // `froze: false` beside a non-null reason used to be impossible. It is now the ordinary shape of
+  // a deploy window, and a subscriber reading the pair as "nothing to see" would be wrong in the
+  // one direction that matters — so the third state is stated.
+  assert.equal(row.payload['froze'], false)
+  assert.equal(row.payload['unobservedReason'], 'no_credential')
+  assert.equal(row.payload['freezeDeferred'], true)
+  assert.equal(row.payload['unobservedRuns'], 1)
+  // And it survives JSON, where an `undefined` would become an absent key every reader treats as
+  // false — the same laundering `drift: null` exists to prevent, two fields over.
+  const built = buildEnvelope(row)
+  assert.ok(built.ok, 'the relay would refuse the envelope built from a deferred run')
+  const delivered = JSON.parse(JSON.stringify(built.value)) as {
+    payload: Record<string, unknown>
+  }
+  assert.ok(Object.hasOwn(delivered.payload, 'freezeDeferred'))
+  assert.equal(delivered.payload['freezeDeferred'], true)
+  assert.equal(delivered.payload['drift'], null, 'nothing is still not zero, on the wire')
+  assert.equal(result.id, row.payload['runId'])
+})
+
+test('EVERY reason has a persistence, and the split is the one the client already draws', { skip: false }, () => {
+  // A total Record, so a ninth reason cannot be added without deciding. Enumerated from
+  // `UNOBSERVED_REASONS` rather than from the object's own keys — reading the map to check the map
+  // is the shape of assertion that passes whatever is in it.
+  for (const reason of UNOBSERVED_REASONS) {
+    assert.ok(
+      UNOBSERVED_PERSISTENCE[reason] === 'transient' || UNOBSERVED_PERSISTENCE[reason] === 'structural',
+      `${reason} has no persistence, so reconciliation cannot decide when to act on it`,
+    )
+  }
+
+  // The split is not new vocabulary: `indexerclient.ts` already says "`no_credential` and
+  // `unauthorized` are faults in THIS platform's authentication. `indexer_error` is the indexer
+  // saying it cannot see the chain." Pinned as a literal set because moving a reason across this
+  // line changes when the estate stops paying people, and that must never be a quiet edit.
+  assert.deepEqual(
+    UNOBSERVED_REASONS.filter(isTransientUnobserved),
+    ['no_credential', 'unauthorized', 'timeout', 'unreachable'],
+  )
+  // `chain_not_followed` — the expected freeze for an unlaunched chain — arrives as `indexer_error`
+  // and must stay on the structural side, or the trap the deploy comments document stops working.
+  assert.equal(isTransientUnobserved('indexer_error'), false)
+  assert.equal(isTransientUnobserved('not_configured'), false)
+})
+
+/* ══════════════════════════════════════════════════════════════════════════════════════════════
+ * micro-org#248 FIX B — WHY PLATFORM EQUITY IS *NOT* NETTED OUT, RECORDED AS A TEST
+ *
+ * #248 offered two fixes and expected them to compose. **They do not**, and the arithmetic is not
+ * subtle once both are written down. Fix A shipped in `settlement/src/treasury.ts`: registering a
+ * treasury with the indexer now also posts an opening entry DEBITING custody and CREDITING platform
+ * equity for that address's balance. Balances are stored in each account's normal direction
+ * (`entries.ts increasesBalance`), so after A the float is a positive number in BOTH the custody
+ * asset total and the platform equity total — and the indexer's observed total counts the treasury
+ * address too, because sweeps move customer coin into it and un-watching it would blind the check.
+ *
+ * Both sides therefore already count the same coin. Netting equity off the ledger side would remove
+ * the float from one side of a comparison that has it on both.
+ *
+ * Measured on the live mainnet ledger, 2026-08-09:
+ *
+ *     custody   asset  available EMBER  25100000000000000000
+ *     platform  equity treasury  EMBER  25000020999999996000
+ *     latest run: indexer, observed 25100000000000000000, drift 0, clean
+ *
+ * `custody − equity` is `99979000000004000`, against an observed `25100000000000000000` — a drift
+ * of the entire platform float, `drift_exceeded`, and EMBER withdrawals stopped estate-wide on
+ * deploy. The design note on #248 reached the same conclusion in prose ("not doing: netting equity
+ * out of the comparison — arithmetically equivalent only while the equity account is correct");
+ * this is that conclusion as something that fails if anyone implements it.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════ */
+
+test('a booked treasury float reconciles clean, and netting it out would be the drift', { skip }, async () => {
+  // The shape settlement's `registerTreasuryWithIndexer` writes: custody up, platform equity up,
+  // one balanced entry, for coin the platform owns with no customer behind it.
+  await post({
+    kind: 'adjustment',
+    originatingService: 'settlement',
+    actor: 'system',
+    correlationId: `corr-${freshKey()}`,
+    idempotencyKey: freshKey('opening'),
+    postings: [
+      {
+        account: { subject: 'custody', assetCode: 'EMBER', purpose: 'available', type: 'asset' },
+        direction: 'debit',
+        amount: 25_000n,
+        assetCode: 'EMBER',
+        sequence: 0,
+      },
+      {
+        account: { subject: 'platform', assetCode: 'EMBER', purpose: 'treasury', type: 'equity' },
+        direction: 'credit',
+        amount: 25_000n,
+        assetCode: 'EMBER',
+        sequence: 1,
+      },
+    ],
+  })
+  // And a customer deposit beside it, so the two are distinguishable rather than one number.
+  await post(depositEntry({ amount: 100n, assetCode: 'EMBER' }))
+
+  // The chain holds both: the treasury address and the deposit addresses are all in the indexer's
+  // custody set.
+  const result = await reconcileAsset(db(), {
+    producer: 'ledger',
+    assetCode: 'EMBER',
+    chain: 'Hearth',
+    network: 'testnet',
+    tolerance: {},
+    indexerObservedTotal: 25_100n,
+  })
+
+  assert.equal(result.ledgerCustodyTotal, '25100', 'the custody total must include the booked float')
+  assert.equal(result.drift, '0')
+  assert.equal(result.status, 'clean')
+  assert.deepEqual(await listFreezes(db()), [])
+
+  // What Fix B as written in #248 would have compared, computed here rather than shipped. If a
+  // future change nets equity out of `custodyTotal`, the assertion above goes red and this one
+  // explains why — a drift of exactly the platform float, on an estate that is provably solvent.
+  const equity = await sql<{ total: string }[]>`
+    select coalesce(sum(b.amount), 0)::text as total
+      from balances b join accounts a on a.id = b.account_id
+     where a.type = 'equity' and a.subject = 'platform' and b.asset_code = 'EMBER'
+  `
+  assert.equal(equity[0]!.total, '25000')
+  assert.equal(
+    BigInt(result.ledgerCustodyTotal) - BigInt(equity[0]!.total) - 25_100n,
+    -25_000n,
+    'netting platform equity out of the ledger side invents a drift of the whole float',
+  )
 })
 
 /* ====================================================== the schema, not the handler */
