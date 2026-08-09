@@ -87,12 +87,28 @@ export class InsufficientFundsError extends Error {
   }
 }
 
-/** Reconciliation drift exceeded tolerance for this asset. Withdrawals are frozen. 409. */
+/**
+ * Reconciliation drift exceeded tolerance for this asset. Withdrawals are frozen. 409.
+ *
+ * **`reason` is a property and is deliberately NOT in `message`.** `reason` is
+ * `asset_freezes.reason`, the diagnostic `reconcile.ts` composes for an operator: the estate's
+ * total custody position in the asset, the total observed on chain, the drift between them, and a
+ * per-bucket breakdown with address counts. It used to be interpolated here, and `Error.message` is
+ * the field every error path in this service hands to `errorReply` — so a refused withdrawal
+ * answered its caller with the platform's treasury position (micro-org#314).
+ *
+ * Nothing is lost by moving it off the message. The one branch that refuses on this error logs
+ * `err.reason` explicitly, and `GET /reconciliation` returns the full string to a read-scoped
+ * operator; those are the two readers it was ever written for.
+ */
 export class AssetFrozenError extends Error {
   readonly assetCode: string
   readonly reason: string
   constructor(assetCode: string, reason: string) {
-    super(`withdrawals in ${assetCode} are frozen: ${reason}`)
+    super(
+      `withdrawals in ${assetCode} are paused while the platform reconciles its records. ` +
+        'This is not a decision about the account, and no balance is changed by it.',
+    )
     this.name = 'AssetFrozenError'
     this.assetCode = assetCode
     this.reason = reason

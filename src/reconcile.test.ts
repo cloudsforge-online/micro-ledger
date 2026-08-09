@@ -310,6 +310,32 @@ test('THE FREEZE: a withdrawal is refused while the asset is frozen', { skip }, 
   )
 })
 
+test('THE FREEZE: the refusal does not carry the estate’s custody position', { skip }, async () => {
+  await post(shardBalance(5_000n))
+  await mintUnbackedLiability(1_000n)
+  assert.equal((await run('SHARD')).froze, true)
+
+  // `Error.message` is what `server.ts` hands to `errorReply` for every refusal it classifies, so
+  // anything interpolated into it is in the 409 body. `asset_freezes.reason` used to be, and that
+  // string is the operator diagnostic: custody total, observed total, drift, and a per-bucket
+  // breakdown with address counts — the platform's treasury position, returned to whoever asked to
+  // withdraw (micro-org#314). The detail is still on `.reason`, which is where the log line and
+  // `GET /reconciliation` read it from; this test is about the one field that travels outward.
+  //
+  // Asserted on the STRUCTURE and not on the exact sentence: the numbers here are this fixture's,
+  // and a future edit to the reason string must not be able to reintroduce the disclosure.
+  const err = await post(shardWithdrawal(100n, 'withdrawal_requested')).then(
+    () => assert.fail('the withdrawal must be refused'),
+    (e: unknown) => e as AssetFrozenError,
+  )
+  assert.ok(err instanceof AssetFrozenError)
+  for (const forbidden of [/custody/i, /observed/i, /drift/i, /\d+\s+address/i, /\d{3,}/]) {
+    assert.doesNotMatch(err.message, forbidden, `message leaks ${forbidden}: ${err.message}`)
+  }
+  // …and the detail is still available to the operator on the property.
+  assert.match(err.reason, /custody/i)
+})
+
 test('THE FREEZE: deposits and refunds are NOT blocked', { skip }, async () => {
   await post(shardBalance(5_000n))
   await mintUnbackedLiability(1_000n)
