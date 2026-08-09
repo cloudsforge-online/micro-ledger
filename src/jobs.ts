@@ -37,9 +37,10 @@ import { type AssetTolerance, type LedgerAssetCode, isChainAsset } from '@clouds
 // chain's human name is a chain fact, so it is taken from the chain contract rather than restated.
 import { chainSpec } from '@cloudsforge/contracts-chain'
 import { rebuildBalances } from './balances.ts'
-import { reconcileAsset } from './reconcile.ts'
+import { reconcileAsset, UNOBSERVED_RUNS_BEFORE_FREEZE } from './reconcile.ts'
 import {
   indexerChainFor,
+  isTransientUnobserved,
   type IndexerClient,
   type Observation,
   type UnobservedReason,
@@ -54,6 +55,27 @@ export const REAP_KIND = 'ledger.idempotency.reap'
 
 const MINUTE = 60_000
 const HOUR = 60 * MINUTE
+
+/**
+ * How long to wait before the one retry a transient absence earns (micro-org#275 item 3).
+ *
+ * Long enough to be on the other side of a container swap and short enough that it is nothing
+ * beside the fifteen-minute sweep interval or the job's own lease. The restart it is written for
+ * put a mainnet sweep inside a window that was closed again by the following sweep; a second and a
+ * half is not a promise to outlast a restart, it is the cheapest chance of stepping over the
+ * moment the socket was refused.
+ *
+ * Not an environment variable for the same reason as `UNOBSERVED_RUNS_BEFORE_FREEZE` in
+ * `reconcile.ts`: it is a property of the mechanism, and the value that would be reached for under
+ * pressure is the one that turns it off. Overridable through `JobDeps` so the suite can drive the
+ * retry without the suite's duration becoming a property of this number.
+ */
+const UNOBSERVED_RETRY_DELAY_MS = 1_500
+
+/** `setTimeout` as a promise. Isolated so the retry above reads as one statement. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
 
 export interface JobDeps {
   readonly sql: Db
@@ -83,6 +105,15 @@ export interface JobDeps {
    */
   readonly indexer: IndexerClient | undefined
   readonly idempotencyTtlDays: number
+  /**
+   * How long to pause before the single retry a transient unobserved reason earns.
+   *
+   * Absent everywhere in production — `index.ts` does not set it and must not — so the constant
+   * below is what the estate runs. It exists so the tests that PROVE the retry happens can do so
+   * without paying for it in wall clock: a suite whose duration is a function of a production
+   * backoff is a suite that gets the backoff shortened.
+   */
+  readonly unobservedRetryDelayMs?: number
 }
 
 export interface RecurringJob {
@@ -308,12 +339,53 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
      *   * **`deps.indexer === undefined`** is a deployment with no `INDEXER_URL`. Nothing was
      *     dialled, and that IS a fact about this deploy manifest — `not_configured`.
      */
-    const observation: Observation =
+    const indexer = deps.indexer
+    const first: Observation =
       chainSlug === undefined
         ? { total: undefined, reason: null, breakdown: null }
-        : deps.indexer === undefined
+        : indexer === undefined
           ? { total: undefined, reason: 'not_configured' as const, breakdown: null }
-          : await deps.indexer.observe(chainSlug, network)
+          : await indexer.observe(chainSlug, network)
+
+    /**
+     * One more attempt, after a short pause, when the first failed for a reason that clears by
+     * itself.
+     *
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     * micro-org#275 item 3: *"the window here was seconds wide. A single retry after a short
+     * backoff would have observed cleanly and no row would ever have been written."* The 23:23:28
+     * sweep on mainnet was inside a restart of `indexer` and `identity`; the next sweep, fifteen
+     * minutes later, was clean.
+     *
+     * **This does not reopen the `retries: 0` argument in `indexerclient.ts`; it is bounded by
+     * the same reasoning.** That rule is about the CLIENT, which must not turn one refusal into a
+     * loop, and it stands — `observe` is still exactly one HTTP call and its deadline still bounds
+     * it absolutely. What changes is a decision the JOB is entitled to make, because the job is
+     * what holds the lease being spent. It spends it at most once more, only when the reason says
+     * waiting could help, and the worst case is bounded and small: two deadlines plus one delay.
+     *
+     * A structural reason is not retried, and that is not an optimisation. `not_configured` has no
+     * URL to dial twice; `indexer_error` is the estate's honest `chain_not_followed`, which is the
+     * expected state for an unlaunched chain and will answer identically in a second. Asking again
+     * would spend the lease of every unfollowed asset on a question already answered, every
+     * fifteen minutes, for as long as the chain stays unlaunched.
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     */
+    let observation: Observation = first
+    if (
+      indexer !== undefined &&
+      chainSlug !== undefined &&
+      first.total === undefined &&
+      first.reason !== null &&
+      isTransientUnobserved(first.reason)
+    ) {
+      deps.metrics.increment('ledger_reconciliation_observe_retried_total', {
+        asset: assetCode,
+        reason: first.reason,
+      })
+      await sleep(deps.unobservedRetryDelayMs ?? UNOBSERVED_RETRY_DELAY_MS)
+      observation = await indexer.observe(chainSlug, network)
+    }
 
     const result = await reconcileAsset(deps.sql, {
       assetCode: asset,
@@ -353,6 +425,20 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
     // and for "this service's token expired ten minutes into a fifteen-minute job", which is a
     // page. One series with a reason label is what lets the second one be alerted on and the first
     // one not be. Written only when there IS a reason: a gauge cannot express "not applicable".
+    // **The series an alert should actually be built on, since micro-org#275.**
+    // `ledger_reconciliation_unobserved_total` fires on every deploy that touches identity, and an
+    // alert that fires on ordinary deploys is one people learn to ignore — which is the state you
+    // least want a solvency freeze to be in on the day it is right. This one counts only the runs
+    // that CROSSED the threshold and stopped withdrawals, so the noisy series stays available for
+    // diagnosis while the page is wired to the consequence. Written only on the transition, never
+    // as a gauge: "how many times has this asset frozen for want of an observation" is a question
+    // a counter answers and a level cannot.
+    if (result.unobservedReason !== null && result.froze) {
+      deps.metrics.increment('ledger_reconciliation_unobserved_freeze_total', {
+        asset: assetCode,
+        reason: result.unobservedReason,
+      })
+    }
     if (result.unobservedReason !== null) {
       deps.metrics.increment('ledger_reconciliation_unobserved_total', {
         asset: assetCode,
@@ -361,7 +447,23 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
     }
 
     const log = deps.logger.child({ job: RECONCILE_KIND, asset: assetCode })
-    if (result.observedSource === 'unavailable') {
+    if (result.freezeDeferred) {
+      // **Not `fatal`, and that is the point of the change rather than a side effect of it.**
+      // Withdrawals are still open, no user has been refused anything, and the run before this one
+      // observed the chain cleanly. What has happened is that this service could not look once —
+      // the ordinary shape of a deploy window — and it says so at the level that shape deserves.
+      //
+      // It still says everything a fatal would: the reason, its remedy, and how many runs in a row
+      // have now failed. If the next sweep fails too this becomes a fatal and a freeze, which is
+      // why the count is in the message rather than only in the fields — the sentence an operator
+      // reads should tell them how close the asset is to stopping.
+      log.warn(
+        `reconciliation could not observe the chain (${String(result.unobservedReason)}) — ` +
+          `${result.unobservedRuns ?? 0} of ${UNOBSERVED_RUNS_BEFORE_FREEZE} consecutive; ` +
+          `withdrawals still open, freeze deferred to the next run`,
+        { ...result, remedy: REMEDIES[result.unobservedReason ?? 'unreachable'] },
+      )
+    } else if (result.observedSource === 'unavailable') {
       // **A distinct message, because it demands a distinct action.** Both this and a drift freeze
       // withdrawals, but "the numbers disagree" sends an operator to the arithmetic while "nobody
       // observed the chain" sends them to the indexer feed. Logging them under one line would send

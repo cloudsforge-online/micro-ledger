@@ -62,10 +62,16 @@ import {
 } from '@cloudsforge/contracts-money'
 import { ON_CHAIN_ASSETS } from '@cloudsforge/contracts-chain'
 import { withOutbox, type Db, type Tx } from './outbox.ts'
-// Type-only. The taxonomy is declared where it is DECIDED — beside the `catch` that classifies a
-// transport failure — rather than here, where it is only written down. Importing it the other way
-// round would put a vocabulary about HTTP into the module that does arithmetic on money.
-import type { UnobservedReason } from './indexerclient.ts'
+// The taxonomy is declared where it is DECIDED — beside the `catch` that classifies a transport
+// failure — rather than here, where it is only written down. Importing it the other way round
+// would put a vocabulary about HTTP into the module that does arithmetic on money.
+//
+// It was a type-only import until micro-org#275, and `isTransientUnobserved` is a deliberate
+// exception rather than a relaxation: this module has to know whether an absence is expected to
+// still be there in fifteen minutes, and re-deriving that here from reason names would be a second
+// copy of a judgement about HTTP — the drift the comment above exists to prevent, made worse by
+// being invisible. What crosses is a boolean about persistence. Nothing that can become a number.
+import { isTransientUnobserved, type UnobservedReason } from './indexerclient.ts'
 
 /**
  * Is this asset settled on a chain, and therefore only ever attestable BY a chain?
@@ -227,6 +233,21 @@ export interface ReconciliationResult {
   readonly unobservedReason: UnobservedReason | null
   readonly froze: boolean
   readonly unfroze: boolean
+  /**
+   * How many runs in a row, ending with this one, observed nothing. `null` when this run observed.
+   *
+   * Counted from the runs table rather than held in memory: the sweep is a leased job that may be
+   * claimed by a different replica every time, so a counter in a process is a counter that resets
+   * on the deploy this whole mechanism exists to survive.
+   */
+  readonly unobservedRuns: number | null
+  /**
+   * This run failed to observe and deliberately did not freeze — see `UNOBSERVED_RUNS_BEFORE_FREEZE`.
+   *
+   * **Never true of a drift.** A measured discrepancy freezes on the first run, as it always has.
+   * This says only "nobody could look, and not yet often enough in a row to act on".
+   */
+  readonly freezeDeferred: boolean
 }
 
 /**
@@ -249,6 +270,80 @@ async function totalFor(sql: Db | Tx, type: string, assetCode: string, subject?:
        and (${subject ?? null}::text is null or a.subject = ${subject ?? null})
   `
   return BigInt(rows[0]?.total ?? '0')
+}
+
+/**
+ * How many consecutive unobserved runs a TRANSIENT reason must produce before it freezes.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * micro-org#275. The sweep runs every fifteen minutes (`jobs.ts`), so `2` means: one blip is
+ * absorbed, and an observer that is genuinely broken still freezes the asset within one further
+ * sweep. Measured against the incident it is written for — mainnet EMBER, 2026-08-08, restart
+ * window 23:23:2x, clean again at 23:38:29 — a restart is seconds wide and fifteen minutes is
+ * three orders of magnitude more room than it needs. `3` was the alternative the issue offered and
+ * it buys nothing here: it would cost another quarter hour of not knowing, against a window
+ * already covered many times over.
+ *
+ * **A constant rather than an environment variable, on purpose.** The number decides how long the
+ * estate is willing to be unable to check itself, which is a property of the design and not of a
+ * deployment; a per-estate knob is a per-estate answer to "why did this not freeze", and the value
+ * that would actually be reached for under pressure is the one that turns the mechanism off.
+ *
+ * **It does not weaken the fail-closed rule, it delays it, and only for reasons that clear by
+ * themselves.** A structural reason still freezes on the first run. A measured drift still freezes
+ * on the first run. Nothing about the comparison changes: an unobserved run still records NULL,
+ * NULL, `failed`, and still cannot lift an existing freeze.
+ *
+ * The alternating case — observe cleanly, fail, observe cleanly, fail — never reaches the
+ * threshold and never freezes. That is correct rather than a hole: every other sweep is a real
+ * observation of a real chain reporting drift zero, so there is no interval in which the asset is
+ * unbacked and unnoticed. What is deferred is a verdict about the OBSERVER.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export const UNOBSERVED_RUNS_BEFORE_FREEZE = 2
+
+/**
+ * How many runs in a row, most recent first, observed nothing — capped at `limit`.
+ *
+ * Called inside the reconciliation transaction and AFTER this run's row is inserted, so the run
+ * being decided counts itself. Reading its own row rather than adding one is what makes the count
+ * the same whichever replica claimed the lease.
+ *
+ * **Counts `observed_source`, never `unobserved_reason`.** The column that says an observation
+ * happened is the one migration 11 constrains against the total and the drift, so it cannot
+ * disagree with them; and the history holds `unrecorded`, migration 12's honest back-fill for rows
+ * written before a reason was stored, which is not a member of `UnobservedReason` and must not
+ * have to be classified to be counted.
+ *
+ * Scoped to `asset_code` alone, matching the primary key of `asset_freezes`: the thing being
+ * decided is one asset's freeze, so the evidence must be that asset's runs and nothing narrower.
+ * `reconciliation_runs_asset_idx` is `(asset_code, started_at desc)`, which is exactly this scan.
+ * `id` breaks the tie because it is a UUIDv7 and therefore already time-ordered — two runs sharing
+ * a `started_at` are two rows of one transaction's `now()`, and ordering them by insert order is
+ * the only reading that is not arbitrary.
+ */
+async function consecutiveUnobservedRuns(sql: Tx, assetCode: string, limit: number): Promise<number> {
+  const rows = await sql<{ observed_source: string }[]>`
+    select observed_source
+      from reconciliation_runs
+     where asset_code = ${assetCode}
+     order by started_at desc, id desc
+     limit ${limit}
+  `
+  let consecutive = 0
+  for (const row of rows) {
+    // `break`, and NOT `continue`. Measured 2026-08-09 by hand-mutating this line: at
+    // `UNOBSERVED_RUNS_BEFORE_FREEZE = 2` the two forms are arithmetically identical and no test
+    // moves, because the window is at most two rows and the first is always this run's own
+    // `unavailable` — so the only shapes reachable are [unavailable] and [unavailable, X], which
+    // both count the same either way. Raise the threshold to 3 and the forms diverge: the same
+    // mutation then reddens 'an observed run RESETS the count' (5 failures against the 4 the
+    // threshold change alone causes). It is written as `break` because CONSECUTIVE is the property
+    // intended, not because today's constant makes it matter.
+    if (row.observed_source !== 'unavailable') break
+    consecutive += 1
+  }
+  return consecutive
 }
 
 /** Longer than any honest breakdown of eight buckets, and short enough to read in a console cell. */
@@ -362,7 +457,45 @@ export async function reconcileAsset(sql: Db, input: ReconcileInput): Promise<Re
     let froze = false
     let unfroze = false
 
-    if (freezesWithdrawals(status)) {
+    /**
+     * How many runs in a row have now failed to observe, and whether this one acts on it.
+     *
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     * **THE DEFECT micro-org#275 REPORTS IS THAT THESE TWO SENTENCES WERE ONE ROW:**
+     *
+     *   * *"I looked and the numbers disagree."* Custody says one thing, the chain says another.
+     *     That is a solvency signal and freezing is correct and urgent.
+     *   * *"I could not look."* No credential, an upstream mid-restart, a refused connection.
+     *     Nothing whatsoever is known about solvency, in either direction, and the prior state of
+     *     the world is unchanged.
+     *
+     * The second was treated as the first, so a rolling restart froze a healthy asset for fifteen
+     * minutes on 2026-08-08 and would do so again on the next deploy that touched identity.
+     *
+     * **What this does NOT do, and the distinction the whole release before it was about:** it
+     * does not invent a total, does not carry a previous one forward, does not fall back to the
+     * ledger's own books, and does not let the run be anything but `failed`. `observedTotal` is
+     * still `null`, `drift` is still `null`, and migration 11 still refuses the row if either
+     * becomes a number. *Nothing is not zero.* The only question asked here is **how many times in
+     * a row nobody has been able to look**, which is a fact about this service's runs table and
+     * about no chain at all — a count of measurements that did not happen can never be mistaken
+     * for a measurement.
+     *
+     * Deferral is only ever reached from `observedTotal === null`. A drift is a number somebody
+     * measured, and it freezes on the first run exactly as it always has.
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     */
+    const unobservedRuns =
+      observedTotal === null
+        ? await consecutiveUnobservedRuns(tx, input.assetCode, UNOBSERVED_RUNS_BEFORE_FREEZE)
+        : null
+    const freezeDeferred =
+      unobservedRuns !== null &&
+      unobservedReason !== null &&
+      isTransientUnobserved(unobservedReason) &&
+      unobservedRuns < UNOBSERVED_RUNS_BEFORE_FREEZE
+
+    if (freezesWithdrawals(status) && !freezeDeferred) {
       // The reason an operator reads first, and the two cases say genuinely different things. A
       // drift is arithmetic they can check. An unavailable observation is not a small drift and
       // must not be phrased as one — there is no number, and printing "drift 0" beside a freeze
@@ -405,6 +538,11 @@ export async function reconcileAsset(sql: Db, input: ReconcileInput): Promise<Re
       `
       froze = true
     } else if (status === 'clean') {
+      // A deferred run reaches NEITHER of these branches, and that is the whole of what deferral
+      // means: `asset_freezes` is not written and not deleted. An asset already frozen — for a
+      // drift, or for a structural absence — stays frozen and keeps the reason and run id of the
+      // run that established it. Refreshing that row with "no indexer observation" would replace an
+      // arithmetic an operator can check with a sentence about a token, on the strength of a blip.
       // **Only an exactly-zero run lifts a freeze.** `drift_within_tolerance` does not, and that
       // asymmetry is on purpose: the bar to lift is higher than the bar that set it, so an asset
       // sitting near the tolerance boundary cannot flap in and out of frozen with every run. An
@@ -426,6 +564,8 @@ export async function reconcileAsset(sql: Db, input: ReconcileInput): Promise<Re
       unobservedReason,
       froze,
       unfroze,
+      unobservedRuns,
+      freezeDeferred,
     }
 
     emit({
@@ -473,6 +613,16 @@ export async function reconcileAsset(sql: Db, input: ReconcileInput): Promise<Re
         // undefined and every reader then sees the safe-looking `false`.
         froze: result.froze,
         unfroze: result.unfroze,
+        // **"Could not look, and have not acted on it yet" is a third state, and it is stated
+        // rather than inferred.** `froze: false` beside a non-null `unobservedReason` used to be
+        // impossible; since micro-org#275 it is the ordinary shape of a deploy window, and a
+        // consumer that read the pair as "nothing to see" would be wrong in the one direction that
+        // matters. Additive to the payload, which the registry allows — `payloadType` names a shape
+        // the producer owns and "a payload change that is not additive is a major"
+        // (`contracts/packages/events`). `unobservedRuns` is a count of runs, never an amount, and
+        // is `null` exactly when something was observed.
+        unobservedRuns: result.unobservedRuns,
+        freezeDeferred: result.freezeDeferred,
       },
       // **No actor and no correlation id, deliberately.** This is a leased job woken by a schedule:
       // there is no principal and no inbound request. The relay maps a null actor to the contract's

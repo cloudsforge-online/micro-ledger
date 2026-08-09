@@ -192,6 +192,72 @@ export const UNOBSERVED_REASONS = Object.freeze([
 export type UnobservedReason = (typeof UNOBSERVED_REASONS)[number]
 
 /**
+ * Whether a reason is expected to still hold fifteen minutes from now.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **"COULD NOT LOOK" IS NOT "LOOKED AND THE NUMBERS DISAGREE", AND NEITHER IS EVERY "COULD NOT
+ * LOOK" THE SAME AS THE NEXT.** micro-org#275: restarting `indexer` and `identity` on mainnet at
+ * 2026-08-08 23:23 UTC put the EMBER sweep inside the window at 23:23:28. It could not mint a
+ * service token, recorded `no_credential`, and froze a healthy asset — a user-visible withdrawal
+ * outage caused by routine maintenance. The 23:38:29 sweep observed cleanly and lifted it. The
+ * mechanism, not the timing, is the defect: identity is a dependency of nearly everything, so
+ * every deploy that touches it carries a coin-flip chance of freezing whichever asset's sweep
+ * lands in the window, and this gets worse as the estate grows. An alert that fires on ordinary
+ * deploys is an alert people learn to ignore, which is the state you least want a solvency freeze
+ * to be in on the day it is right.
+ *
+ * The split is not new vocabulary. It is the one the header of this file already draws:
+ * "`no_credential` and `unauthorized` are faults in THIS platform's authentication. `indexer_error`
+ * is the indexer saying it cannot see the chain." Read as a question about persistence:
+ *
+ *   * **`transient`** — nothing answered YET. The observer, or the path to it, is momentarily
+ *     absent: no token this second, a refused connection, a deadline. A rolling restart is
+ *     seconds wide and every one of these clears by itself.
+ *   * **`structural`** — something answered definitively and the answer was not a total, or
+ *     nothing was ever dialled because this deployment is not configured to. Waiting does not
+ *     change any of them, and `indexer_error` in particular is where the estate's honest
+ *     `chain_not_followed` lives — the freeze an operator must be able to leave alone, and the
+ *     reconciliation-freeze trap the deploy compose comments document. It must keep freezing on
+ *     the first run.
+ *
+ * `no_credential` sits on the transient side even though, like `not_configured`, no request left
+ * the process. The difference is what the absence is a fact ABOUT: `not_configured` is a fact
+ * about this deploy manifest and holds until someone redeploys, while `no_credential` is a fact
+ * about this second — identity may be mid-restart, which is exactly the incident above.
+ *
+ * **This decides only WHEN a freeze is written, never WHAT is compared.** No value here may ever
+ * become a total, produce a drift, or let a run be `clean`; a transient reason still records
+ * `unavailable`, a NULL observed total and a NULL drift, and still fails. See `reconcile.ts`.
+ *
+ * A total `Record`, like `REMEDIES` in `jobs.ts`, so a ninth reason added to the union above
+ * without a decision about its persistence is a compile error rather than a default.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export const UNOBSERVED_PERSISTENCE: Record<UnobservedReason, 'transient' | 'structural'> =
+  Object.freeze({
+    not_configured: 'structural',
+    // `no_credential` is a member of the fixed `UnobservedReason` union above and appears here as a
+    // KEY; the literal beside it is one of the two words this map may contain, and
+    // `reconcile.test.ts` checks that exhaustively against `UNOBSERVED_REASONS`. The name is for the
+    // ABSENCE of a credential — the one thing a secret cannot be — so the scanner's finding is a
+    // true match on a name and a false one on a value. Kept as the marker rather than renamed: the
+    // reason is a stored column value and migration 12 back-filled history with it.
+    // secret-hygiene: allow the key names an unobserved reason, and the value is one of two fixed words
+    no_credential: 'transient',
+    unauthorized: 'transient',
+    timeout: 'transient',
+    unreachable: 'transient',
+    indexer_error: 'structural',
+    indexer_refused: 'structural',
+    unusable_answer: 'structural',
+  })
+
+/** Sugar over `UNOBSERVED_PERSISTENCE`, so call sites read as the question they are asking. */
+export function isTransientUnobserved(reason: UnobservedReason): boolean {
+  return UNOBSERVED_PERSISTENCE[reason] === 'transient'
+}
+
+/**
  * One attempt to read the chain half of the invariant.
  *
  * The two fields are exclusive by construction — `total` is present exactly when `reason` is `null`
