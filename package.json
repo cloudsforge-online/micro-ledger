@@ -1,6 +1,6 @@
 {
   "name": "@cloudsforge/ledger",
-  "version": "2.5.9",
+  "version": "2.5.12",
   "private": true,
   "description": "Double-entry accounting: the financial source of truth. Accounts, journal entries, postings, balances, reservations, reconciliation.",
   "license": "MIT",
