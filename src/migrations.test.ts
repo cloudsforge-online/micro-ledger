@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { checksumOf } from '@cloudsforge/db'
 import { ENTRY_KINDS } from '@cloudsforge/contracts-money'
-import { RETIRED_ASSETS } from '@cloudsforge/contracts-chain'
+import { ON_CHAIN_ASSETS, RETIRED_ASSETS } from '@cloudsforge/contracts-chain'
 import { ACQUISITION_KINDS } from './entries.ts'
 import { BASELINE_VERSION, MIGRATIONS, SCHEMA_VERSION } from './migrations.ts'
 
@@ -91,6 +91,7 @@ const APPLIED_CHECKSUMS: Readonly<Record<number, string>> = Object.freeze({
   12: '37b85469',
   13: 'f17ce678',
   14: 'e2aee319',
+  15: '6947d48c',
 })
 
 test('AN APPLIED MIGRATION IS IMMUTABLE, and this is where editing one is caught', () => {
@@ -128,6 +129,62 @@ test('migration 11 in particular still says exactly what it said, LTC having gon
   assert.doesNotMatch(eleven.up, /'LTC'/, 'LTC was added to migration 11 instead of to a new one')
   assert.match(fourteen.up, /insert into chain_assets[\s\S]*?'LTC'/)
   assert.match(fourteen.up, /on conflict \(asset_code\) do nothing/)
+})
+
+/**
+ * The codes seeded into `chain_assets`, read out of the migrations rather than restated.
+ *
+ * Narrow on purpose, and it fails loudly if it matches nothing: a regex that quietly returned an
+ * empty list would make the assertion below vacuous — and "the table agrees with ON_CHAIN_ASSETS"
+ * passing because it compared nothing to nothing is precisely the shape of failure the second copy
+ * of that list is dangerous for.
+ */
+function chainAssetsSeededInSql(): readonly string[] {
+  const inserts = [...sql.matchAll(/insert into chain_assets \(asset_code, note\) values([\s\S]*?)on conflict/g)]
+  assert.ok(inserts.length > 0, 'no chain_assets seed could be read out of the migrations')
+  return inserts.flatMap((insert) => [...insert[1]!.matchAll(/\('([A-Z]+)',/g)].map((row) => row[1]!))
+}
+
+test('the seeded chain assets are exactly ON_CHAIN_ASSETS, checked without a database', () => {
+  // `reconcile.test.ts` already asserts this against a live table, and that assertion is the
+  // authoritative one — it reads what actually got applied. This one exists because it runs where
+  // there is no Postgres: the live check is skipped in that environment, so a contracts release
+  // that adds an asset would otherwise sail through a whole suite green and be caught by the
+  // reconciliation of an asset the trigger does not know about, in production.
+  assert.deepEqual([...chainAssetsSeededInSql()].sort(), [...ON_CHAIN_ASSETS].sort())
+})
+
+test('DOGE and ETC went in as migration 15, and 11 and 14 still do not mention them', () => {
+  const fifteen = MIGRATIONS.find((m) => m.version === 15)
+  assert.ok(fifteen, 'migration 15 is missing')
+  assert.match(fifteen.up, /insert into chain_assets[\s\S]*?'DOGE'/)
+  assert.match(fifteen.up, /insert into chain_assets[\s\S]*?'ETC'/)
+  assert.match(fifteen.up, /on conflict \(asset_code\) do nothing/)
+  for (const version of [11, 14]) {
+    const earlier = MIGRATIONS.find((m) => m.version === version)!
+    assert.doesNotMatch(
+      statementsOf(earlier.up),
+      /'(DOGE|ETC)'/,
+      `an asset was added to migration ${version} instead of to a new one`,
+    )
+  }
+})
+
+test('MIGRATION 15 SEEDS ROWS AND SCHEDULES NOTHING — the two are not the same decision', () => {
+  // The trap this migration is one half of. `chain_assets` membership says HOW a DOGE or ETC
+  // reconciliation must be answered; `LEDGER_RECONCILE_ASSETS` decides whether one is ever asked
+  // for, and there is no node for either asset. A sweep of an asset nothing can observe records
+  // `unavailable`/`failed`, which writes an `asset_freezes` row that only a clean OBSERVED run
+  // lifts — so it is not undone by removing the name again. A migration that also enqueued a job,
+  // or wrote a freeze, or touched that table, would take that one-way step on a deploy.
+  const fifteen = MIGRATIONS.find((m) => m.version === 15)!
+  const statements = statementsOf(fifteen.up)
+  assert.doesNotMatch(statements, /\bjobs\b/i)
+  assert.doesNotMatch(statements, /asset_freezes/i)
+  assert.doesNotMatch(statements, /reconciliation_runs/i)
+  // One statement, and it is the seed. Counted rather than eyeballed: the assertions above are a
+  // blocklist, and a blocklist cannot see the table nobody thought to name.
+  assert.equal(statements.split(';').filter((s) => s.trim().length > 0).length, 1)
 })
 
 test('every table the service reads or writes is created', () => {
