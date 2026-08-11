@@ -16,7 +16,12 @@
  */
 
 import { hostname } from 'node:os'
-import type { AssetTolerance, LedgerAssetCode } from '@cloudsforge/contracts-money'
+import {
+  isTokenAsset,
+  parseChainTokenAsset,
+  type AssetTolerance,
+  type LedgerAssetCode,
+} from '@cloudsforge/contracts-money'
 import { assertGeneratedSecret, assertServiceCredential } from '@cloudsforge/secrets'
 
 /**
@@ -400,6 +405,36 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     .filter((a) => a.length > 0)
   if (assets.length === 0) {
     throw new EnvError('LEDGER_RECONCILE_ASSETS must name at least one asset')
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════════════════════════
+  // A USER-MINTED `TOKEN:` ASSET MAY NOT BE SWEPT, AND NAMING ONE HERE IS A ONE-WAY MISTAKE.
+  //
+  // micro-org#407 §1. A tessera object is `TOKEN:cf:tessera:object:<hex>` — no chain, no contract,
+  // nothing that observes it. It is also not in `ON_CHAIN_ASSETS`, so the INVARIANT 6 trigger
+  // (migration 11) permits `observed_source = 'liability_sum'`: a sweep would compare the custody
+  // total (zero — an issued object has no custody, by construction) against the author's liability
+  // (one) and record drift. Drift beyond tolerance writes an `asset_freezes` row, and only an
+  // exactly-clean OBSERVED run lifts one. An unobservable asset cannot produce one, so removing
+  // the name afterwards leaves the freeze standing — the same trap migration 15 spells out for
+  // DOGE and ETC, except that here it is reached by an asset the estate MINTS rather than one an
+  // operator adds.
+  //
+  // A CHAIN token — `TOKEN:<chain>:<network>:<0x contract>` — is deliberately still allowed. That
+  // one is observable in principle (an ERC-20 balance is a thing the indexer can read), so the
+  // refusal is narrow: it is about assets with no possible observer, not about the `TOKEN:` prefix.
+  // ══════════════════════════════════════════════════════════════════════════════════════════════
+  const unobservable = assets.filter(
+    (a) => isTokenAsset(a as LedgerAssetCode) && parseChainTokenAsset(a as LedgerAssetCode) === null,
+  )
+  if (unobservable.length > 0) {
+    throw new EnvError(
+      `LEDGER_RECONCILE_ASSETS names ${unobservable.join(', ')}, which nothing can observe. A ` +
+        'user-minted TOKEN: asset (a tessera object) has no custody and no chain, so a sweep ' +
+        'would read drift against its own liability and freeze it permanently — only an ' +
+        'exactly-clean observed run lifts a freeze, and there can never be one. Remove it. A ' +
+        'chain token, TOKEN:<chain>:<network>:<0x contract>, is accepted.',
+    )
   }
 
   return {
