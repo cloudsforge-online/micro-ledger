@@ -92,6 +92,7 @@ const APPLIED_CHECKSUMS: Readonly<Record<number, string>> = Object.freeze({
   13: 'f17ce678',
   14: 'e2aee319',
   15: '6947d48c',
+  16: 'a1d45986',
 })
 
 test('AN APPLIED MIGRATION IS IMMUTABLE, and this is where editing one is caught', () => {
@@ -334,12 +335,39 @@ test('amounts are numeric(78,0) — never a float, anywhere', () => {
 })
 
 test('the entry kind constraint lists exactly the closed set from contracts-money', () => {
-  const constraint = /journal_entries_kind_chk check \(kind in \(([\s\S]*?)\)\)/.exec(sql)
-  assert.ok(constraint, 'the kind constraint is missing')
-  const listed = [...constraint[1]!.matchAll(/'([a-z_]+)'/g)].map((m) => m[1]!)
+  // The LAST definition wins, because that is what the database ends up with. The constraint is
+  // declared in migration 1 and re-declared by migration 16 (drop, add, validate) — an applied
+  // migration may not be edited, so extending the vocabulary is always a later re-declaration, and
+  // a test that read the FIRST match would be asserting against a constraint that no longer exists.
+  const declarations = [...sql.matchAll(/journal_entries_kind_chk check \(kind in \(([\s\S]*?)\)\)/g)]
+  assert.ok(declarations.length > 0, 'the kind constraint is missing')
+  const listed = [...declarations.at(-1)![1]!.matchAll(/'([a-z_]+)'/g)].map((m) => m[1]!)
   // Both directions. A kind in the database that contracts-money does not know is unpostable; a
   // kind in contracts-money the database refuses is a 500 waiting for the first caller to use it.
   assert.deepEqual([...listed].sort(), [...ENTRY_KINDS].sort())
+  // Every declaration must name a real kind, so an earlier one cannot quietly hold a typo that a
+  // fresh database applies and an existing one never sees.
+  for (const declaration of declarations) {
+    for (const [, kind] of declaration[1]!.matchAll(/'([a-z_]+)'/g)) {
+      assert.ok(ENTRY_KINDS.includes(kind as never), `a kind declaration names '${kind}'`)
+    }
+  }
+})
+
+test('a re-declared kind constraint drops the old one and validates the new one', () => {
+  // Migration 16's shape, asserted because getting it wrong is silent. Without the drop, `add
+  // constraint` fails on a duplicate name and the deploy stops; without `validate`, the constraint
+  // stays NOT VALID — honoured for new rows, ignored by the planner, and indistinguishable from a
+  // forgotten step. `not valid` itself is the part that keeps the lock off a growing table.
+  const redeclarations = MIGRATIONS.filter(
+    (m) => m.version > 1 && /add constraint journal_entries_kind_chk/.test(m.up),
+  )
+  assert.ok(redeclarations.length > 0, 'migration 16 no longer re-declares the kind constraint')
+  for (const m of redeclarations) {
+    assert.match(m.up, /drop constraint if exists journal_entries_kind_chk/, `${m.name} has no drop`)
+    assert.match(m.up, /\)\) not valid;/, `${m.name} takes an ACCESS EXCLUSIVE lock for a full scan`)
+    assert.match(m.up, /validate constraint journal_entries_kind_chk/, `${m.name} leaves it NOT VALID`)
+  }
 })
 
 test('the balances shadow carries no overdraft trigger, so a rebuild cannot suppress its own finding', () => {

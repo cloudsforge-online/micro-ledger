@@ -145,6 +145,28 @@ test('the reconciled asset list must not be empty', () => {
   ])
 })
 
+test('an asset nothing can observe is refused at boot, because a sweep of one is permanent', () => {
+  // micro-org#407 §1. A tessera object is minted BY this estate, so unlike DOGE or ETC it needs no
+  // operator to add it to a list before it exists — the trap is one edit away at all times. It has
+  // no custody and no chain, it is not in ON_CHAIN_ASSETS, so a run would compare zero against the
+  // author's liability, record drift, and write a freeze that only an exactly-clean OBSERVED run
+  // can lift. There can never be one. Refusing at boot is the only place this is still reversible.
+  const object = `TOKEN:cf:tessera:object:${'ab'.repeat(32)}`
+  assert.throws(
+    () => loadEnv({ ...BASE, LEDGER_RECONCILE_ASSETS: `EMBER,${object}` }),
+    /which nothing can observe/,
+  )
+  // Narrow on purpose: a CHAIN token is observable in principle, so the prefix alone is not the
+  // test. If this ever throws, the guard has become "no TOKEN: assets", which is a different rule.
+  assert.deepEqual(
+    loadEnv({
+      ...BASE,
+      LEDGER_RECONCILE_ASSETS: `EMBER,TOKEN:eth:mainnet:0x${'a'.repeat(40)}`,
+    }).reconcileAssets,
+    ['EMBER', `TOKEN:eth:mainnet:0x${'a'.repeat(40)}`],
+  )
+})
+
 test('LOG_LEVEL is a closed set', () => {
   assert.throws(() => loadEnv({ ...BASE, LOG_LEVEL: 'verbose' }), /LOG_LEVEL must be one of/)
 })

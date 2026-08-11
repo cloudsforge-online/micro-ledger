@@ -1130,6 +1130,82 @@ export const MIGRATIONS: readonly Migration[] = [
       on conflict (asset_code) do nothing;
     `,
   },
+
+  {
+    version: 16,
+    name: 'item_issue_entry_kind',
+    up: `
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+      -- 'item_issue' JOINS THE CLOSED VOCABULARY, BECAUSE micro-tessera HAS BEEN POSTING IT SINCE
+      -- BEFORE IT EXISTED.
+      --
+      -- 'tessera/src/ledgerclient.ts' issues one object to its author with kind 'item_issue'. That
+      -- kind was never in ENTRY_KINDS and never in the constraint below, so every issuance this
+      -- estate has ever attempted was refused — 'validateEntryRequest' answers an unknown kind with
+      -- a 400 before a transaction is opened, so the refusal never even reached this CHECK. Zero
+      -- TOKEN: accounts exist in the live ledger, which is the visible consequence: micro-tessera
+      -- cannot activate a listing at all. micro-org#407 §3.
+      --
+      -- The alternative was to make micro-tessera spell an existing kind — the fix
+      -- 'foresight.settlement_fee' got, which became 'fee_charged'. It is the wrong one here.
+      -- Issuance is not a fee, a reward, a purchase or an adjustment: it is the event in which a
+      -- new unit of a TOKEN: asset comes into existence, credited to its author against a clearing
+      -- account. Filing it under 'adjustment' would make "how many of this object exist, and when
+      -- did each appear" unanswerable from the journal, and the first paragraph of the constraint
+      -- says why that matters: the vocabulary IS the audit.
+      --
+      -- ── WHY THIS IS A NEW MIGRATION AND NOT AN EDIT TO 1 ─────────────────────────────────────
+      --
+      -- Migration text is CHECKSUMMED (@cloudsforge/db, checksumOf). Adding the word to migration
+      -- 1's list would change a checksum every environment has already recorded, and every one of
+      -- them would refuse to start — the same reasoning migrations 14 and 15 give for chain assets.
+      -- So the constraint is dropped and re-added here, in full.
+      --
+      -- ── WHY DROP-AND-ADD IS SAFE ON THE LIVE ESTATE, AND WHAT IT COSTS ───────────────────────
+      --
+      -- 'drop constraint ... if exists' then 'add constraint ... not valid', followed by
+      -- 'validate constraint'. The two-step is deliberate: 'add constraint' alone takes an ACCESS
+      -- EXCLUSIVE lock and scans every row in 'journal_entries' while holding it, which on a table
+      -- that only ever grows is a write outage of unbounded length. 'not valid' takes the lock for
+      -- the catalogue write alone and applies to every row inserted from that instant; 'validate
+      -- constraint' then reads the existing rows under a SHARE UPDATE EXCLUSIVE lock, which does
+      -- not block inserts. Postings are immutable and append-only (INVARIANT 2), so there is no
+      -- window in which an unchecked row can slip in.
+      --
+      -- The validation cannot fail. The new list is a strict superset of the old one, so every row
+      -- that satisfied the old constraint satisfies this one. It is still run rather than assumed:
+      -- a constraint left NOT VALID is honoured for new rows but ignored by the planner, and a
+      -- future reader would have no way to tell "deliberately deferred" from "forgotten".
+      --
+      -- ── WHAT THIS MIGRATION DOES NOT DO ──────────────────────────────────────────────────────
+      --
+      -- It does not add 'item_issue' to migration 13's acquisition set. That set is what may not be
+      -- denominated in a RETIRED asset, and it names the ways a USER acquires one — purchase,
+      -- subscription_charge, deposit_credited. An issuance is the system bringing an object into
+      -- existence against a clearing account; a TOKEN: asset code cannot be retired because
+      -- RETIRED_ASSETS is a contracts-chain list of chain assets, so widening that guard here would
+      -- add a rule that can never match.
+      --
+      -- It also does not backfill anything. There is nothing to backfill: no 'item_issue' row was
+      -- ever written, because none was ever accepted.
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+
+      alter table journal_entries
+        drop constraint if exists journal_entries_kind_chk;
+
+      alter table journal_entries
+        add constraint journal_entries_kind_chk check (kind in (
+          'deposit_credited', 'withdrawal_requested', 'withdrawal_settled', 'withdrawal_refunded',
+          'conversion', 'transfer', 'purchase', 'subscription_charge', 'fee_charged',
+          'reward_granted', 'item_issue', 'market_escrow', 'market_settled', 'royalty_paid',
+          'trading_fill', 'performance_fee', 'creator_payout', 'treasury_spend', 'adjustment',
+          'reconciliation_correction', 'reversal'
+        )) not valid;
+
+      alter table journal_entries
+        validate constraint journal_entries_kind_chk;
+    `,
+  },
 ]
 
 /**
