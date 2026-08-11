@@ -28,6 +28,7 @@ import {
 import { ForbiddenError, TokenError, bearerFrom, requireScope, statusFor, type Principal } from '@cloudsforge/auth'
 import type { Lifecycle } from '@cloudsforge/lifecycle'
 import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
+import { ENTRY_KINDS, isEntryKind } from '@cloudsforge/contracts-money'
 import type { EntryKind, EntryMetadata, LedgerAssetCode } from '@cloudsforge/contracts-money'
 import { AccountConflictError, UnknownAccountError, balancesForSubject } from './accounts.ts'
 import {
@@ -742,6 +743,30 @@ function requireString(body: Record<string, unknown>, field: string): string {
   return value.trim()
 }
 
+/**
+ * The entry kind, CHECKED rather than asserted — micro-org#424.
+ *
+ * This was `requireString(body, 'kind') as EntryKind`, which is a promise to the compiler about a
+ * value that arrived over the wire. It was not a live defect, because `validateEntryRequest` runs
+ * `isEntryKind` a moment later, but it is the wrong shape for the one place in the estate that owns
+ * the vocabulary: a cast here means the type says "checked" everywhere downstream on the strength
+ * of nothing, and the day someone reorders the parse and the validation it becomes real.
+ *
+ * The error it raises is also better than the generic one. Two services have shipped an invented
+ * kind — foresight's `foresight.settlement_fee` and tessera's `item_issue` (micro-org#407 §3) — and
+ * in both cases the author's next question was "then what ARE the kinds?". The answer is now in the
+ * 400, which is where the person reading it already is.
+ */
+function requireEntryKind(body: Record<string, unknown>): EntryKind {
+  const kind = requireString(body, 'kind')
+  if (!isEntryKind(kind)) {
+    throw new LedgerValidationError(
+      `unknown entry kind: ${kind} — the vocabulary is closed, and is: ${ENTRY_KINDS.join(', ')}`,
+    )
+  }
+  return kind
+}
+
 function optionalString(body: Record<string, unknown>, field: string): string | undefined {
   const value = body[field]
   if (value === undefined || value === null) return undefined
@@ -816,7 +841,7 @@ export function parsePostEntry(body: Record<string, unknown>, fallbackCorrelatio
   })
 
   return {
-    kind: requireString(body, 'kind') as EntryKind,
+    kind: requireEntryKind(body),
     originatingService: requireString(body, 'originatingService'),
     actor: requireString(body, 'actor') as `service:${string}`,
     correlationId: optionalString(body, 'correlationId') ?? fallbackCorrelationId,
