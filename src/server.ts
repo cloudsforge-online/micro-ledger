@@ -446,8 +446,10 @@ function buildRoutes(): Route[] {
         ...optionalParam(ctx, 'cursor'),
         ...optionalParam(ctx, 'originatingService'),
         ...optionalParam(ctx, 'correlationId'),
+        // Checked, not cast: `listEntries` would refuse an unknown kind anyway, but a filter is
+        // the one place a caller TYPES a kind by hand, so it is where a typo is likeliest.
         ...(ctx.url.searchParams.get('kind')
-          ? { kind: ctx.url.searchParams.get('kind') as EntryKind }
+          ? { kind: entryKindOrRefuse(ctx.url.searchParams.get('kind')!) }
           : {}),
       })
       return { status: 200, body: page }
@@ -478,9 +480,7 @@ function buildRoutes(): Route[] {
             ...(optionalString(body, 'description') !== undefined
               ? { description: optionalString(body, 'description')! }
               : {}),
-            ...(optionalString(body, 'kind') !== undefined
-              ? { kind: optionalString(body, 'kind') as EntryKind }
-              : {}),
+            ...(optionalEntryKind(body) !== undefined ? { kind: optionalEntryKind(body)! } : {}),
             ...(body['metadata'] !== undefined ? { metadata: body['metadata'] as EntryMetadata } : {}),
           },
           requestFingerprint(body),
@@ -515,9 +515,7 @@ function buildRoutes(): Route[] {
             ...(optionalString(body, 'description') !== undefined
               ? { description: optionalString(body, 'description')! }
               : {}),
-            ...(optionalString(body, 'kind') !== undefined
-              ? { kind: optionalString(body, 'kind') as EntryKind }
-              : {}),
+            ...(optionalEntryKind(body) !== undefined ? { kind: optionalEntryKind(body)! } : {}),
             ...(body['metadata'] !== undefined ? { metadata: body['metadata'] as EntryMetadata } : {}),
           },
           requestFingerprint(body),
@@ -758,7 +756,26 @@ function requireString(body: Record<string, unknown>, field: string): string {
  * 400, which is where the person reading it already is.
  */
 function requireEntryKind(body: Record<string, unknown>): EntryKind {
-  const kind = requireString(body, 'kind')
+  return entryKindOrRefuse(requireString(body, 'kind'))
+}
+
+/**
+ * The kind on a REVERSAL, which is optional and was the one that could still reach the database.
+ *
+ * `POST /entries/:id/reverse` lets the caller name the kind of the correcting entry, and that value
+ * was cast, passed to `reverseEntry`, and inserted. Nothing on the path ran `isEntryKind`:
+ * `validateEntryRequest` is for `POST /entries` and never sees a reversal. So an invented kind here
+ * did not get the ledger's 400 — it got as far as `journal_entries_kind_chk` and came back as a
+ * database exception, which is a 500 the operator has to read postgres logs to explain.
+ *
+ * Same check, same message, one route earlier.
+ */
+function optionalEntryKind(body: Record<string, unknown>): EntryKind | undefined {
+  const kind = optionalString(body, 'kind')
+  return kind === undefined ? undefined : entryKindOrRefuse(kind)
+}
+
+function entryKindOrRefuse(kind: string): EntryKind {
   if (!isEntryKind(kind)) {
     throw new LedgerValidationError(
       `unknown entry kind: ${kind} — the vocabulary is closed, and is: ${ENTRY_KINDS.join(', ')}`,

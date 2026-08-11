@@ -406,6 +406,49 @@ test('a reversal round-trips through HTTP', { skip }, async () => {
   assert.equal(trial.body['entryCount'], 2, 'the mistake AND the fix are both in the journal')
 })
 
+test('a reversal that names an invented kind is 400, not a database exception', { skip }, async () => {
+  // micro-org#424, the case the first pass left behind. `validateEntryRequest` guards `POST
+  // /entries` and never sees a reversal, so the optional `kind` on this route was cast, mirrored
+  // and inserted — and the only thing that stopped it was `journal_entries_kind_chk`, one layer
+  // too late to say anything useful. The caller got a 500 and the operator got to read postgres
+  // logs. The check belongs at the door, with the same message the posting route gives.
+  const posted = await call('POST', '/entries', { token: 'svc-all', body: depositBody('700') })
+  const entryId = posted.body['entry']!['id'] as unknown as string
+
+  const response = await call('POST', `/entries/${entryId}/reverse`, {
+    token: 'svc-all',
+    body: {
+      originatingService: 'wallet',
+      actor: 'operator:1',
+      idempotencyKey: freshKey(),
+      kind: 'wallet.correction',
+    },
+  })
+  assert.equal(response.status, 400)
+  assert.equal(response.body['error']!['code'], 'invalid_entry')
+  assert.match(String(response.body['error']!['message']), /unknown entry kind: wallet\.correction/)
+  // `reversal` is a real member, so the route still accepts one — this refuses the invented kind,
+  // not the parameter.
+  const good = await call('POST', `/entries/${entryId}/reverse`, {
+    token: 'svc-all',
+    body: {
+      originatingService: 'wallet',
+      actor: 'operator:1',
+      idempotencyKey: freshKey(),
+      kind: 'reversal',
+    },
+  })
+  assert.equal(good.status, 201)
+})
+
+test('a filter on an invented kind is 400 rather than an empty page', { skip }, async () => {
+  // An empty list would read as "no entries of that kind", which is a different and much worse
+  // answer than "there is no such kind" when the caller has simply mistyped one.
+  const response = await call('GET', '/entries?kind=wallet.deposit', { token: 'svc-read' })
+  assert.equal(response.status, 400)
+  assert.equal(response.body['error']!['code'], 'invalid_entry')
+})
+
 test('reversing something that does not exist is 404', { skip }, async () => {
   const response = await call('POST', '/entries/019a0000-0000-7000-8000-0000000000ff/reverse', {
     token: 'svc-all',
