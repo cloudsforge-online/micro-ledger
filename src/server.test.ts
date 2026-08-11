@@ -248,6 +248,23 @@ test('an unbalanced entry is 400 and names the asset and the difference', { skip
   assert.match(JSON.stringify(response.body['error']!['problems']), /EMBER is out by 1/)
 })
 
+test('an invented kind is refused, and the refusal names the vocabulary', { skip }, async () => {
+  // micro-org#424. Two services have shipped a kind that is not in the closed set — foresight's
+  // `foresight.settlement_fee` and tessera's `item_issue` (micro-org#407 §3) — and in both cases
+  // nothing was recorded for months, because the symptom of this defect is silence. The compile-time
+  // half of the fix is `PostEntryRequest.kind: EntryKind` in every client. This is the runtime half:
+  // the parser CHECKS rather than casts, and the 400 answers the author's next question by listing
+  // what the kinds actually are.
+  const body = { ...depositBody('1000'), kind: 'wallet.deposit_credited' }
+  const response = await call('POST', '/entries', { token: 'svc-all', body })
+  assert.equal(response.status, 400)
+  assert.equal(response.body['error']!['code'], 'invalid_entry')
+  const message = String(response.body['error']!['message'])
+  assert.match(message, /unknown entry kind: wallet\.deposit_credited/)
+  assert.match(message, /deposit_credited/)
+  assert.match(message, /item_issue/)
+})
+
 test('a purchase in a retired asset is 400 retired_asset, named so the caller can act', { skip }, async () => {
   // The wire half of migration 13. `invalid_entry` would tell micro-mint to retry; `retired_asset`
   // tells it to change what it settles in, which is the only thing that will ever work.
