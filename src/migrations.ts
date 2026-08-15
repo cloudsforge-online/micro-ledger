@@ -1206,6 +1206,83 @@ export const MIGRATIONS: readonly Migration[] = [
         validate constraint journal_entries_kind_chk;
     `,
   },
+
+  {
+    version: 17,
+    name: 'liquidity_seed_entry_kind',
+    up: `
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+      -- 'liquidity_seed' JOINS THE CLOSED VOCABULARY, BECAUSE FORGE EXCHANGE PUTS MINED EMBER INTO
+      -- AN AMM POOL AND NO EXISTING KIND DESCRIBES THAT.
+      --
+      -- docs/ecosystem/39 §6 phase F seeds a Hearth V2 pair on EMBER mainnet out of what the two
+      -- estate miners have produced, and the gate on that phase is written as "the estate's own
+      -- solvency reporting books the seeded liquidity". Booking it needs a word, and none of the
+      -- twenty-one already here is the right one:
+      --
+      --   'treasury_spend'  — nothing was spent. The position is recoverable in full by burning
+      --                       the LP tokens the estate holds, and the estate holds all of them.
+      --   'transfer'        — a transfer leaves two subjects each holding what they hold. Here the
+      --                       counter-asset is minted into the same act, and from the moment the
+      --                       pair is live the reserves move on every stranger's swap.
+      --   'conversion'      — nothing was exchanged at a rate. The rate is what the pool is FOR.
+      --   'adjustment'      — the escape hatch, and using it would make "how much of the estate's
+      --                       own EMBER is committed to a pool, and since when" unanswerable from
+      --                       the journal. The vocabulary IS the audit (migration 1, first
+      --                       paragraph of the constraint).
+      --
+      -- ── WHAT IT POSTS, AND THE ACCOUNT IT DELIBERATELY DOES NOT TOUCH ────────────────────────
+      --
+      --   DEBIT   platform / <asset> / reserved   (type asset)   the position, owned but illiquid
+      --   CREDIT  platform / <asset> / treasury   (type equity)  mining income, now recognised
+      --
+      -- The second side is equity because the EMBER being seeded was mined by the estate and was
+      -- never anyone's claim: it belongs to no user, no organisation and no custody arrangement.
+      --
+      -- The account this must NEVER touch is anything with subject 'custody'. reconcile.ts sums
+      -- exactly (type = 'asset' AND subject = 'custody') for an asset and compares it to what the
+      -- indexer observes across the addresses labelled 'deposit:' and 'treasury:'. EMBER's drift
+      -- tolerance is zero. A pair's reserve changes whenever an outsider trades against it, so
+      -- booking a pool as custody — or adding the pair address to the watched set — would put a
+      -- number nobody controls on one side of an equality with zero slack, and the first swap by a
+      -- stranger would freeze every EMBER withdrawal in the estate. docs/ecosystem/35 G1 names
+      -- that failure: watching an address without booking it is "an invented insolvency", and this
+      -- is its mirror image. Neither side of this entry carries subject 'custody', so the
+      -- reconciliation total is arithmetically untouched by seeding a pool.
+      --
+      -- ── WHY THIS IS A NEW MIGRATION AND NOT AN EDIT TO 16 ────────────────────────────────────
+      --
+      -- Migration text is CHECKSUMMED (@cloudsforge/db, checksumOf). Editing 16 would change a
+      -- checksum every environment has already recorded and none of them would start. Same reason
+      -- 16 gave for not editing 1, and 14 and 15 gave for not editing 11.
+      --
+      -- The drop/add-not-valid/validate shape is 16's, for 16's reasons: 'add constraint' alone
+      -- takes ACCESS EXCLUSIVE and scans a table that only grows, which is a write outage of
+      -- unbounded length; 'not valid' takes the lock for the catalogue write alone and binds every
+      -- row inserted from that instant; 'validate' then reads the existing rows under SHARE UPDATE
+      -- EXCLUSIVE, which does not block inserts. The new list is a strict superset of the old one,
+      -- so validation cannot fail — it is still run, because a constraint left NOT VALID is
+      -- ignored by the planner and indistinguishable from a forgotten step.
+      --
+      -- Nothing is backfilled. No 'liquidity_seed' row exists, because none was ever accepted.
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+
+      alter table journal_entries
+        drop constraint if exists journal_entries_kind_chk;
+
+      alter table journal_entries
+        add constraint journal_entries_kind_chk check (kind in (
+          'deposit_credited', 'withdrawal_requested', 'withdrawal_settled', 'withdrawal_refunded',
+          'conversion', 'transfer', 'purchase', 'subscription_charge', 'fee_charged',
+          'reward_granted', 'item_issue', 'liquidity_seed', 'market_escrow', 'market_settled',
+          'royalty_paid', 'trading_fill', 'performance_fee', 'creator_payout', 'treasury_spend',
+          'adjustment', 'reconciliation_correction', 'reversal'
+        )) not valid;
+
+      alter table journal_entries
+        validate constraint journal_entries_kind_chk;
+    `,
+  },
 ]
 
 /**
