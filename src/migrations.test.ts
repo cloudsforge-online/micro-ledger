@@ -93,6 +93,7 @@ const APPLIED_CHECKSUMS: Readonly<Record<number, string>> = Object.freeze({
   14: 'e2aee319',
   15: '6947d48c',
   16: 'a1d45986',
+  17: '33a00a97',
 })
 
 test('AN APPLIED MIGRATION IS IMMUTABLE, and this is where editing one is caught', () => {
