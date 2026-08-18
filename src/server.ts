@@ -353,7 +353,16 @@ async function handle(route: Route | undefined, ctx: RequestContext, deps: Serve
       return errorReply(404, 'not_found', err.message, ctx.requestId)
     }
     if (err instanceof InsufficientFundsError) {
-      return errorReply(409, 'insufficient_funds', err.message, ctx.requestId)
+      // `subject` and `purpose` travel as fields, so a caller can tell whose money ran out without
+      // parsing English. micro-org#495: since the exchange desk is a non-exempt account, this one
+      // status now covers both "the user does not have it" and "the platform does not have it",
+      // and micro-wallet answers those two with different codes and different words. The message
+      // stays as the trigger wrote it — it names the account and the resulting balance, which is
+      // an operator's diagnosis and not something a caller forwards to a person.
+      return errorReply(409, 'insufficient_funds', err.message, ctx.requestId, {
+        ...(err.subject !== null ? { subject: err.subject } : {}),
+        ...(err.purpose !== null ? { purpose: err.purpose } : {}),
+      })
     }
     if (err instanceof AssetFrozenError) {
       ctx.log.warn('withdrawal refused: asset frozen', { asset: err.assetCode, reason: err.reason })
@@ -446,6 +455,10 @@ function buildRoutes(): Route[] {
         ...optionalParam(ctx, 'cursor'),
         ...optionalParam(ctx, 'originatingService'),
         ...optionalParam(ctx, 'correlationId'),
+        // Whose entries, rather than what kind of entry. Added for micro-org#495 §3 so a service
+        // can read one user's conversions and transfers out of the journal instead of keeping a
+        // second copy of them; see `ListEntriesQuery.subject` for why the absence forced a table.
+        ...optionalParam(ctx, 'subject'),
         // Checked, not cast: `listEntries` would refuse an unknown kind anyway, but a filter is
         // the one place a caller TYPES a kind by hand, so it is where a typo is likeliest.
         ...(ctx.url.searchParams.get('kind')

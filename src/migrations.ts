@@ -1283,6 +1283,75 @@ export const MIGRATIONS: readonly Migration[] = [
         validate constraint journal_entries_kind_chk;
     `,
   },
+
+  {
+    version: 18,
+    name: 'exchange_desk_inventory_purpose',
+    up: `
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+      -- 'inventory' JOINS THE ACCOUNT PURPOSES, BECAUSE THE EXCHANGE DESK SELLS OUT OF A STOCK IT
+      -- CAN EXHAUST AND THIS SCHEMA HAD NO WAY TO SAY SO.
+      --
+      -- micro-org#495 §1. micro-wallet's convert() posts the two counter-legs of every conversion
+      -- to clearing/<asset>. Read balances_no_overdraft in migration 7 in order:
+      --
+      --     if acct.type = 'clearing' then return null; end if;
+      --     if acct.overdraft_allowed or acct.purpose = 'suspense' then return null; end if;
+      --     raise exception '... may not go negative without overdraft_allowed';
+      --
+      -- The clearing branch returns BEFORE overdraft_allowed is ever read. So a user converting
+      -- into EMBER is credited EMBER out of an account that simply goes further negative, entry
+      -- after entry, with nothing in the schema or the service refusing. The platform hands out a
+      -- coin it does not hold, and the only record that it did is a clearing balance nobody reads.
+      --
+      -- The desk is therefore exchange/<asset>/inventory at type 'equity'. 'equity' is
+      -- credit-normal, which is what the desk is — a position the platform owns — AND it falls
+      -- through to the overdraft check, so an overdrawing conversion is refused by THIS trigger,
+      -- inside the entry's own transaction, serialised on the balance row. Two conversions racing
+      -- for the last of a coin cannot both win. micro-wallet's TypeScript pre-check exists so the
+      -- ordinary case is answered with a named 409 rather than a constraint violation; it is not
+      -- what makes the invariant true, and it is not where the invariant lives.
+      --
+      -- ── WHY A NEW PURPOSE AND NOT 'treasury' ────────────────────────────────────────────────
+      --
+      -- A treasury balance is money the platform holds. An inventory balance is money the platform
+      -- has undertaken to sell at a rate it quoted itself. Reading whether the desk can still
+      -- trade means reading one without the other, and accounts_key_uniq is (subject, asset_code,
+      -- purpose) — so folding the desk into 'treasury' under a new subject would work, and would
+      -- put "can we still fill a conversion" and "what does the estate own" in one number.
+      --
+      -- ── WHY A NEW MIGRATION AND NOT AN EDIT TO 4 ────────────────────────────────────────────
+      --
+      -- Migration text is CHECKSUMMED (@cloudsforge/db, checksumOf). Editing 4 would change a
+      -- checksum every environment has already recorded and none of them would start. Same reason
+      -- 17 gave for not editing 16, and 16 gave for not editing 1.
+      --
+      -- The drop/add-not-valid/validate shape is 17's, for 17's reasons: 'add constraint' alone
+      -- takes ACCESS EXCLUSIVE and scans the whole chart of accounts, which is a write outage of
+      -- unbounded length; 'not valid' takes the lock for the catalogue write alone and binds every
+      -- row inserted from that instant; 'validate' then reads the existing rows under SHARE UPDATE
+      -- EXCLUSIVE, which does not block inserts. The new list is a strict superset of the old one,
+      -- so validation cannot fail — it is still run, because a constraint left NOT VALID is
+      -- ignored by the planner and indistinguishable from a forgotten step.
+      --
+      -- Nothing is backfilled. No account has purpose 'inventory', because none could be created.
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+
+      alter table accounts
+        drop constraint if exists accounts_purpose_chk;
+
+      alter table accounts
+        add constraint accounts_purpose_chk check (
+          purpose in (
+            'available', 'reserved', 'escrow', 'treasury', 'fees', 'payout_due', 'suspense',
+            'inventory'
+          )
+        ) not valid;
+
+      alter table accounts
+        validate constraint accounts_purpose_chk;
+    `,
+  },
 ]
 
 /**

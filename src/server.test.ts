@@ -16,7 +16,7 @@ import { TokenError, VerifierUnavailableError, type Principal } from '@cloudsfor
 import { Lifecycle } from '@cloudsforge/lifecycle'
 import { Logger, Metrics, registerHttpMetrics, registerJobMetrics } from '@cloudsforge/telemetry'
 import { createServer, registerServiceMetrics, type PrincipalVerifier } from './server.ts'
-import { ALICE, enabled, freshKey, migrateTestDb, openDb, resetLedger, skip } from './testsupport.ts'
+import { ALICE, BOB, enabled, freshKey, migrateTestDb, openDb, resetLedger, skip } from './testsupport.ts'
 import type { Db } from './outbox.ts'
 
 /**
@@ -439,6 +439,125 @@ test('a reversal that names an invented kind is 400, not a database exception', 
     },
   })
   assert.equal(good.status, 201)
+})
+
+test('entries are filtered by SUBJECT, and an entry comes back whole', { skip }, async () => {
+  // micro-org#495 §3. Without this filter the only ways to answer "what did this person convert"
+  // were to page the entire journal and filter in the caller — micro-wallet's README calls that
+  // defect 5 — or to keep a second copy of every conversion in a wallet-side table, which is a
+  // second thing to disagree with the journal.
+  await call('POST', '/entries', { token: 'svc-all', body: depositBody('1000') })
+  await call('POST', '/entries', {
+    token: 'svc-all',
+    body: {
+      kind: 'transfer',
+      originatingService: 'wallet',
+      actor: 'system',
+      correlationId: 'c-subject',
+      idempotencyKey: freshKey(),
+      postings: [
+        { account: { subject: ALICE, assetCode: 'EMBER', purpose: 'available', type: 'liability' }, direction: 'debit', amount: '400', assetCode: 'EMBER', sequence: 0 },
+        { account: { subject: BOB, assetCode: 'EMBER', purpose: 'available', type: 'liability' }, direction: 'credit', amount: '400', assetCode: 'EMBER', sequence: 1 },
+      ],
+    },
+  })
+
+  const bob = await call('GET', `/entries?subject=${encodeURIComponent(BOB)}`, { token: 'svc-read' })
+  assert.equal(bob.status, 200)
+  const entries = bob.body['entries'] as unknown as { kind: string; postings: unknown[] }[]
+  assert.equal(entries.length, 1, 'the deposit BOB has no posting on must not be in his page')
+  assert.equal(entries[0]!.kind, 'transfer')
+  // Whole, with the counterparty's leg on it. Half a double-entry is not a thing this service
+  // returns, and a caller deriving direction needs both sides.
+  assert.equal(entries[0]!.postings.length, 2)
+
+  // The filters compose, so "this person's conversions" is one query rather than a scan.
+  const wrongKind = await call(
+    `GET`, `/entries?subject=${encodeURIComponent(BOB)}&kind=conversion`, { token: 'svc-read' },
+  )
+  assert.equal((wrongKind.body['entries'] as unknown as unknown[]).length, 0)
+
+  // A subject nobody has posted against is an empty page, not an error: "you have no conversions"
+  // is a true and useful answer on the first day of an account.
+  const stranger = await call('GET', '/entries?subject=user%3A00000000-0000-4000-8000-00000000ffff', { token: 'svc-read' })
+  assert.equal(stranger.status, 200)
+  assert.equal((stranger.body['entries'] as unknown as unknown[]).length, 0)
+})
+
+test('the exchange desk may not sell what it does not hold, and the refusal names it', { skip }, async () => {
+  // THE INVARIANT micro-org#495 EXISTS TO CLOSE, asserted at the layer that enforces it.
+  //
+  // micro-wallet's convert() posted both counter-legs to clearing/<asset>, and
+  // `ledger_assert_no_overdraft` returns early for type = 'clearing' BEFORE it reads
+  // `overdraft_allowed` — so the platform handed out coins it did not hold and the clearing
+  // account simply went further negative. The desk is exchange/<asset>/inventory at type 'equity',
+  // which is NOT exempt, so the refusal is this trigger's, inside the entry's own transaction.
+  const desk = { subject: 'exchange', assetCode: 'EMBER', purpose: 'inventory', type: 'equity' } as const
+  const sell = (amount: string) => ({
+    kind: 'conversion',
+    originatingService: 'wallet',
+    actor: 'system',
+    correlationId: 'c-desk',
+    idempotencyKey: freshKey(),
+    postings: [
+      { account: desk, direction: 'debit', amount, assetCode: 'EMBER', sequence: 0 },
+      { account: { subject: ALICE, assetCode: 'EMBER', purpose: 'available', type: 'liability' }, direction: 'credit', amount, assetCode: 'EMBER', sequence: 1 },
+    ],
+  })
+
+  const empty = await call('POST', '/entries', { token: 'svc-all', body: sell('100') })
+  assert.equal(empty.status, 409)
+  assert.equal(empty.body['error']!['code'], 'insufficient_funds')
+  // The fields, not the prose. micro-wallet answers "you are short" and "the desk is out" with
+  // different codes and different words, and it cannot tell them apart from the message alone.
+  assert.equal(empty.body['error']!['subject'], 'exchange')
+  assert.equal(empty.body['error']!['purpose'], 'inventory')
+
+  // Nothing was written. A 409 that had already posted half an entry would be the worse defect.
+  const journal = await call('GET', '/entries', { token: 'svc-read' })
+  assert.equal((journal.body['entries'] as unknown as unknown[]).length, 0)
+
+  // Fund it, and the same conversion goes through — this is a stock that can run out, not an
+  // account that is refused on principle.
+  //
+  // Two entries, because the treasury is not exempt either: the desk is funded OUT of something,
+  // and an operator who has not recognised the income first is refused at the source account
+  // rather than quietly overdrawing it. That is the same invariant one account earlier.
+  const treasury = { subject: 'platform', assetCode: 'EMBER', purpose: 'treasury', type: 'equity' } as const
+  const recognised = await call('POST', '/entries', {
+    token: 'svc-all',
+    body: {
+      kind: 'liquidity_seed',
+      originatingService: 'wallet',
+      actor: 'operator:1',
+      correlationId: 'c-desk-income',
+      idempotencyKey: freshKey(),
+      postings: [
+        { account: { subject: 'platform', assetCode: 'EMBER', purpose: 'reserved', type: 'asset' }, direction: 'debit', amount: '150', assetCode: 'EMBER', sequence: 0 },
+        { account: treasury, direction: 'credit', amount: '150', assetCode: 'EMBER', sequence: 1 },
+      ],
+    },
+  })
+  assert.equal(recognised.status, 201)
+
+  const funded = await call('POST', '/entries', {
+    token: 'svc-all',
+    body: {
+      kind: 'liquidity_seed',
+      originatingService: 'wallet',
+      actor: 'operator:1',
+      correlationId: 'c-desk-fund',
+      idempotencyKey: freshKey(),
+      postings: [
+        { account: treasury, direction: 'debit', amount: '150', assetCode: 'EMBER', sequence: 0 },
+        { account: desk, direction: 'credit', amount: '150', assetCode: 'EMBER', sequence: 1 },
+      ],
+    },
+  })
+  assert.equal(funded.status, 201)
+  assert.equal((await call('POST', '/entries', { token: 'svc-all', body: sell('100') })).status, 201)
+  // 50 left, so the next 100 is refused by the same trigger on a balance it can now read.
+  assert.equal((await call('POST', '/entries', { token: 'svc-all', body: sell('100') })).status, 409)
 })
 
 test('a filter on an invented kind is 400 rather than an empty page', { skip }, async () => {

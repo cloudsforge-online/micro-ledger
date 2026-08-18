@@ -79,11 +79,28 @@ export class UnbalancedEntryError extends Error {
   }
 }
 
-/** A liability would have gone negative. 409 — the caller may not spend what is not there. */
+/**
+ * A liability would have gone negative. 409 — the caller may not spend what is not there.
+ *
+ * **`subject` and `purpose` name WHICH account ran out, and they are properties rather than
+ * something a caller re-derives from the message.** The overdraft trigger fires for any account
+ * that is not overdraft-exempt, and since micro-org#495 that includes the exchange desk
+ * (`exchange`/`inventory`/`equity`) as well as a user's own balance. Those two refusals need
+ * opposite answers: one is "you do not have this", the other is "we do not have this", and a
+ * caller that cannot tell them apart tells a user their balance is short when it is not.
+ *
+ * Null when the trigger's message did not carry them, which is only reachable if the trigger is
+ * ever reworded without this parser following it. The refusal still stands in that case; it just
+ * loses the attribution.
+ */
 export class InsufficientFundsError extends Error {
-  constructor(message: string) {
+  readonly subject: string | null
+  readonly purpose: string | null
+  constructor(message: string, subject: string | null = null, purpose: string | null = null) {
     super(message)
     this.name = 'InsufficientFundsError'
+    this.subject = subject
+    this.purpose = purpose
   }
 }
 
@@ -326,7 +343,12 @@ export function mapDatabaseError(err: unknown): unknown {
     return new UnbalancedEntryError(message)
   }
   if (/may not go negative/.test(message)) {
-    return new InsufficientFundsError(message)
+    // The subject and purpose are recovered from the trigger's own wording, the same technique the
+    // retired-asset branch below uses and for the same reason: the message is raised by a trigger
+    // in this repository's `migrations.ts`, so the coupling is internal and both halves change
+    // together. It is `account <id> (<subject> <purpose>) would go to …`.
+    const detail = /^account \S+ \((\S+) (\S+)\) would go to /.exec(message)
+    return new InsufficientFundsError(message, detail?.[1] ?? null, detail?.[2] ?? null)
   }
   if (/is retired and may not be acquired/.test(message)) {
     // Reachable when a posting arrives by a route that skipped `validateEntryRequest`, or when the
@@ -728,6 +750,24 @@ export interface ListEntriesQuery {
   readonly kind?: EntryKind
   readonly originatingService?: string
   readonly correlationId?: string
+  /**
+   * Only entries with a posting against an account belonging to this subject.
+   *
+   * **The filter this list was missing, and the absence had a consequence.** micro-org#495 §3 asked
+   * micro-wallet to read a user's own conversions and transfers out of the journal rather than
+   * keep a second copy of them in a wallet-side table — the entry already carries every figure in
+   * its metadata, and a second copy is a second thing to disagree. There was no way to ask for one
+   * subject's entries: `kind`, `originatingService` and `correlationId` were the whole vocabulary,
+   * and every one of them is a property of the entry rather than of who it was about. The only
+   * shapes available were "page the entire journal and filter in the caller" — which is defect 5 in
+   * micro-wallet's own README — or a duplicate table.
+   *
+   * It is an entry-level filter, not a posting-level one: an entry is returned WHOLE, with the
+   * counterparty's postings on it, because half a double-entry is not a thing this service returns.
+   * Authorisation for that is the caller's: `ledger:read` is a service scope and no end user holds
+   * one.
+   */
+  readonly subject?: string
 }
 
 export interface EntryPage {
@@ -763,6 +803,13 @@ export async function listEntries(sql: Db, query: ListEntriesQuery): Promise<Ent
 
   // One extra row, so "is there another page" is answered without a second COUNT query over a
   // table that only ever grows.
+  //
+  // The subject filter is a semi-join and not an EXISTS correlated on `journal_entries.id`, which
+  // matters: the correlated form makes the planner walk the journal newest-first probing each row,
+  // so a subject with a handful of entries in a large journal pays for the whole journal. The `in`
+  // form lets it build the subject's entry-id set first — `accounts_subject_idx` finds the
+  // accounts, `postings_account_idx` is keyed on `account_id` and finds their postings — and that
+  // set is bounded by what one subject has done rather than by how long the estate has run.
   const rows = await sql<EntryRow[]>`
     select id, kind, description, originating_service, actor, correlation_id, idempotency_key,
            reverses_entry_id, occurred_at, recorded_at, metadata
@@ -773,6 +820,12 @@ export async function listEntries(sql: Db, query: ListEntriesQuery): Promise<Ent
             or originating_service = ${query.originatingService ?? null})
        and (${query.correlationId ?? null}::text is null
             or correlation_id = ${query.correlationId ?? null})
+       and (${query.subject ?? null}::text is null or id in (
+             select p.entry_id
+               from postings p
+               join accounts a on a.id = p.account_id
+              where a.subject = ${query.subject ?? null}
+           ))
      order by id desc
      limit ${limit + 1}
   `
