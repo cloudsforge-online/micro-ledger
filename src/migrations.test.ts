@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { checksumOf } from '@cloudsforge/db'
-import { ENTRY_KINDS } from '@cloudsforge/contracts-money'
+import { ACCOUNT_PURPOSES, ENTRY_KINDS } from '@cloudsforge/contracts-money'
 import { ON_CHAIN_ASSETS, RETIRED_ASSETS } from '@cloudsforge/contracts-chain'
 import { ACQUISITION_KINDS } from './entries.ts'
 import { BASELINE_VERSION, MIGRATIONS, SCHEMA_VERSION } from './migrations.ts'
@@ -94,6 +94,7 @@ const APPLIED_CHECKSUMS: Readonly<Record<number, string>> = Object.freeze({
   15: '6947d48c',
   16: 'a1d45986',
   17: '33a00a97',
+  18: '59494859',
 })
 
 test('AN APPLIED MIGRATION IS IMMUTABLE, and this is where editing one is caught', () => {
@@ -368,6 +369,36 @@ test('a re-declared kind constraint drops the old one and validates the new one'
     assert.match(m.up, /drop constraint if exists journal_entries_kind_chk/, `${m.name} has no drop`)
     assert.match(m.up, /\)\) not valid;/, `${m.name} takes an ACCESS EXCLUSIVE lock for a full scan`)
     assert.match(m.up, /validate constraint journal_entries_kind_chk/, `${m.name} leaves it NOT VALID`)
+  }
+})
+
+test('the account purpose constraint lists exactly the closed set from contracts-money', () => {
+  // The same rule as the kind constraint above, and for the same reason: the LAST declaration is
+  // what the database ends up with. Declared in migration 4 and re-declared by 18, which added
+  // 'inventory' for the exchange desk (micro-org#495).
+  const declarations = [...sql.matchAll(/accounts_purpose_chk check \(\s*purpose in \(([\s\S]*?)\)/g)]
+  assert.ok(declarations.length > 0, 'the purpose constraint is missing')
+  const listed = [...declarations.at(-1)![1]!.matchAll(/'([a-z_]+)'/g)].map((m) => m[1]!)
+  // Both directions. A purpose the database refuses is a 500 the first time a service opens an
+  // account with it; a purpose the database admits and contracts-money does not name is an account
+  // nothing in the estate can address.
+  assert.deepEqual([...listed].sort(), [...ACCOUNT_PURPOSES].sort())
+  for (const declaration of declarations) {
+    for (const [, purpose] of declaration[1]!.matchAll(/'([a-z_]+)'/g)) {
+      assert.ok(ACCOUNT_PURPOSES.includes(purpose as never), `a purpose declaration names '${purpose}'`)
+    }
+  }
+})
+
+test('a re-declared purpose constraint drops the old one and validates the new one', () => {
+  const redeclarations = MIGRATIONS.filter(
+    (m) => m.version > 4 && /add constraint accounts_purpose_chk/.test(m.up),
+  )
+  assert.ok(redeclarations.length > 0, 'migration 18 no longer re-declares the purpose constraint')
+  for (const m of redeclarations) {
+    assert.match(m.up, /drop constraint if exists accounts_purpose_chk/, `${m.name} has no drop`)
+    assert.match(m.up, /\) not valid;/, `${m.name} takes an ACCESS EXCLUSIVE lock for a full scan`)
+    assert.match(m.up, /validate constraint accounts_purpose_chk/, `${m.name} leaves it NOT VALID`)
   }
 })
 
