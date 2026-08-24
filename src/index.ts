@@ -116,6 +116,18 @@ lifecycle
 // 6. Routes. Constructed after the Lifecycle so the health handlers report real state, and after
 //    the pool so the stores are real rather than a lazily-connected surprise on first request.
 const verifier = new Verifier({ jwksUrl: env.identityJwksUrl, issuer: env.identityIssuer })
+// ── WHICH ESTATE THIS DEPLOYMENT IS ─────────────────────────────────────────────────────────
+//
+// The `networkSql` key below used to be the literal `mainnet`. Same image, same code,
+// different env — so the TESTNET pod registered its testnet DSN under the name `mainnet` and
+// then refused every request the gateway stamped `CF-Network: testnet`, because it genuinely
+// held no handle by that name. Five services crash-looped on it within ten minutes of the
+// first deploy: the refusal was right, the registration was wrong.
+//
+// `CF_NETWORK_SINGLE` is how a single-network pod says which estate it is. The render sets it
+// for every deployment; `mainnet` remains the default only for a bare `pnpm dev`.
+const ownNetwork = (env.singleNetwork || 'mainnet') as 'mainnet' | 'testnet'
+
 const server = createServer({
   lifecycle,
   logger,
@@ -123,10 +135,14 @@ const server = createServer({
   verifier,
   // The SELECTOR, not a handle — routes use `ctx.sql`, resolved once per request.
   sql: networkSql({
-    mainnet: sql as unknown as RuntimeSql,
+    [ownNetwork]: sql as unknown as RuntimeSql,
     ...(sqlTestnet ? { testnet: sqlTestnet as unknown as RuntimeSql } : {}),
   }),
-  ...(env.singleNetwork ? { singleNetwork: env.singleNetwork as 'mainnet' | 'testnet' } : {}),
+  // The fallback for a request with no `CF-Network` header — which is EVERY service-to-service
+  // call, because those go container to container and never reach the gateway that stamps one.
+  // `requestNetwork` still prefers the header, so this cannot mask a mis-stamped external
+  // request; it only answers the internal callers that never had one.
+  singleNetwork: ownNetwork,
   producer: SERVICE,
   // Sampled at scrape time rather than on a timer. There is no `setInterval` in this repository
   // and CI greps for one — rule 8. A scrape is already periodic, so the scrape is when to sample.
