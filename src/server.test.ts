@@ -7,6 +7,7 @@
  * that would sign every service in the estate out at once.
  */
 
+import { networkSql, type Sql as RuntimeSql } from '@cloudsforge/db'
 import { test, before, after, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import type { AddressInfo } from 'node:net'
@@ -71,7 +72,8 @@ before(async () => {
     logger: new Logger({ service: 'ledger-test', level: 'error', sink: () => {} }),
     metrics,
     verifier,
-    sql: sql as unknown as Db,
+    sql: singleNetworkSql(sql as unknown as Db),
+    singleNetwork: 'mainnet' as const,
     producer: 'ledger',
   })
   await new Promise<void>((resolve) => server.listen(0, () => resolve()))
@@ -710,3 +712,12 @@ test('a reservation and its release are both bound', { skip }, async () => {
   assert.equal(byPurpose['reserved'], '400')
   assert.equal(byPurpose['available'], '600')
 })
+
+/**
+ * One handle, presented as the per-network selector the server now takes. The fixture runs against
+ * a single test database, so mainnet is the only configured network — which exercises the REFUSAL
+ * path for free: anything reaching for testnet throws rather than reusing this handle.
+ */
+function singleNetworkSql(db: unknown) {
+  return networkSql({ mainnet: db as RuntimeSql })
+}
