@@ -230,6 +230,18 @@ export interface Env {
    * connection-string variable, so adding a second one here fails the build rather than review.
    */
   readonly databaseUrl: string
+  /**
+   * The TESTNET database, when this deployment serves both networks. Empty means single-network —
+   * `networkSql` then holds one handle and REFUSES a testnet request rather than answering it out
+   * of mainnet rows (micro-deploy `docs/network-consolidation.md` §2.2).
+   */
+  readonly databaseUrlTestnet: string
+  /**
+   * The network to assume when a request carries no `CF-Network`, or empty to refuse. Set for
+   * `pnpm dev`, which has no gateway. Never in production, where guessing makes a routing fault a
+   * silent cross-network write.
+   */
+  readonly singleNetwork: string
   readonly databasePoolMax: number
   readonly identityJwksUrl: string
   readonly identityIssuer: string
@@ -443,6 +455,8 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     version: optional(source, 'CLOUDSFORGE_TAG', 'dev'),
     logLevel: logLevel as Env['logLevel'],
     databaseUrl: required(source, 'LEDGER_DATABASE_URL'),
+    databaseUrlTestnet: source['LEDGER_DATABASE_URL_TESTNET'] ?? '',
+    singleNetwork: source['CF_NETWORK_SINGLE'] ?? '',
     databasePoolMax: integer(source, 'LEDGER_DATABASE_POOL_MAX', 10, 1, 500),
     identityJwksUrl: required(source, 'IDENTITY_JWKS_URL'),
     identityIssuer: required(source, 'IDENTITY_ISSUER'),
