@@ -130,9 +130,9 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
     })
     .register({
       name: 'ledger_reconciliation_drift',
-      help: 'Ledger custody total minus observed total, per asset. The sign carries the meaning. Only set when a run actually observed something — read it with ledger_reconciliation_observed.',
+      help: 'Ledger custody total minus observed total, per asset and network. The sign carries the meaning. Only set when a run actually observed something — read it with ledger_reconciliation_observed.',
       kind: 'gauge',
-      labels: ['asset'],
+      labels: ['asset', 'network'],
     })
     /**
      * **Read this BEFORE `ledger_reconciliation_drift`, or read that one wrong.**
@@ -149,7 +149,7 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
       name: 'ledger_reconciliation_observed',
       help: '1 if the last reconciliation of this asset compared against a real observation, 0 if it had none. A 0 makes the drift gauge for that asset meaningless.',
       kind: 'gauge',
-      labels: ['asset'],
+      labels: ['asset', 'network'],
     })
     /**
      * **The series that tells the two freezes apart, and the one whose absence let a defect hide.**
@@ -166,11 +166,31 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
      * it now" — and unlike a gauge it does not hold a stale value once observation recovers.
      * Cardinality is bounded by `UnobservedReason`, which is a closed union of eight strings.
      */
+    /**
+     * **The series that says a sweep is still HAPPENING, as opposed to what it found.**
+     *
+     * The two gauges above describe the last run. Neither can describe the absence of runs: a gauge
+     * holds its last value, so when the sweep stops they freeze at whatever they last said and a
+     * week-old healthy zero is indistinguishable from a fresh one. That is not hypothetical —
+     * micro-org#533, testnet went seven days unreconciled and the only alert, which reads
+     * `ledger_reconciliation_drift != 0`, could not fire because a sweep that never runs publishes
+     * no drift at all.
+     *
+     * A unix timestamp is the one shape immune to that, because the alert reads `time() - value`
+     * and staleness therefore has a value rather than being an absence. Paired with
+     * `LedgerReconciliationStale`.
+     */
+    .register({
+      name: 'ledger_reconciliation_last_run_timestamp',
+      help: 'Unix seconds at which reconciliation last completed for this asset and network. Alert on age, not on the value: a sweep that has stopped leaves every other reconciliation series frozen at a reassuring number.',
+      kind: 'gauge',
+      labels: ['asset', 'network'],
+    })
     .register({
       name: 'ledger_reconciliation_unobserved_total',
       help: 'Reconciliation runs that observed nothing, by asset and by WHY. `no_credential` and `unauthorized` are faults in this platform, not in the chain.',
       kind: 'counter',
-      labels: ['asset', 'reason'],
+      labels: ['asset', 'network', 'reason'],
     })
     /**
      * Whether this process holds a service token it could present right now.

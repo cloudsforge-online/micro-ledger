@@ -304,7 +304,21 @@ export interface Env {
    * ════════════════════════════════════════════════════════════════════════════════════════════
    */
   readonly reconcileAssets: readonly LedgerAssetCode[]
-  readonly reconcileNetwork: 'mainnet' | 'testnet'
+  /**
+   * Every network whose ledger this process reconciles. One entry, or several, comma-separated.
+   *
+   * **It is a LIST because it was a scalar, and that silently stopped a sweep for a week**
+   * (micro-org#533). Before the consolidation there were two ledger deployments, each with its own
+   * database and its own single-valued `LEDGER_RECONCILE_NETWORK`. The merge kept one process —
+   * which holds BOTH connection strings and serves both networks over HTTP — but the reconciliation
+   * loop still named one network, so testnet stopped being swept on the day of the merge and stayed
+   * unswept. Nothing failed; the jobs were simply never created.
+   *
+   * A scalar here is not a smaller version of a list, it is a claim that this process is
+   * responsible for one network. That claim stopped being true and nothing noticed, because the
+   * only reconciliation alert fires on a drift VALUE and a sweep that never runs publishes none.
+   */
+  readonly reconcileNetworks: readonly ('mainnet' | 'testnet')[]
   /**
    * Where the chain half of the solvency invariant is read from —
    * `GET /v1/custody/:chain/:network/total` on `micro-indexer`.
@@ -406,9 +420,23 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     throw new EnvError(`LOG_LEVEL must be one of debug, info, warn, error (got ${logLevel})`)
   }
 
-  const network = optional(source, 'LEDGER_RECONCILE_NETWORK', 'testnet')
-  if (network !== 'mainnet' && network !== 'testnet') {
-    throw new EnvError(`LEDGER_RECONCILE_NETWORK must be mainnet or testnet (got ${network})`)
+  // Order-preserving dedupe: the manifest is the record of what this deployment is responsible
+  // for, and a repeated entry there is a typo rather than a request to sweep twice.
+  const networks: ('mainnet' | 'testnet')[] = []
+  for (const raw of optional(source, 'LEDGER_RECONCILE_NETWORK', 'testnet').split(',')) {
+    const value = raw.trim()
+    if (value.length === 0) continue
+    if (value !== 'mainnet' && value !== 'testnet') {
+      throw new EnvError(`LEDGER_RECONCILE_NETWORK must be mainnet or testnet (got ${value})`)
+    }
+    if (!networks.includes(value)) networks.push(value)
+  }
+  if (networks.length === 0) {
+    // Empty is refused rather than defaulted. An operator who wants nothing reconciled empties
+    // LEDGER_RECONCILE_ASSETS, which is the documented escape hatch and leaves the freezes in
+    // place; an empty network list would stop every asset on every network while still looking
+    // like a configured deployment.
+    throw new EnvError('LEDGER_RECONCILE_NETWORK must name at least one network')
   }
 
   const assets = optional(source, 'LEDGER_RECONCILE_ASSETS', 'SHARD,EMBER')
@@ -465,7 +493,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     instanceId: optional(source, 'INSTANCE_ID', host || 'unknown'),
     assetTolerance: parseAssetTolerance(optional(source, 'LEDGER_ASSET_TOLERANCE', '{}')),
     reconcileAssets: assets as readonly LedgerAssetCode[],
-    reconcileNetwork: network,
+    reconcileNetworks: networks,
     indexerUrl: optionalUrl(source, 'INDEXER_URL'),
     indexerDeadlineMs: integer(source, 'LEDGER_INDEXER_DEADLINE_MS', 5_000, 100, 60_000),
     // Optional, not required: see the field comment. The absence is caught by a reconciliation run

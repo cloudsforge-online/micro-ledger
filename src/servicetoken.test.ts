@@ -243,7 +243,11 @@ function jobDeps(indexer: JobDeps['indexer']): JobDeps {
     // non-zero drift below freezes. That is the behaviour under test, not a fixture convenience.
     assetTolerance: {},
     reconcileAssets: ['EMBER'],
-    reconcileNetwork: 'testnet',
+    reconcileNetworks: ['testnet'],
+    // The same handle as `sql` above. These fixtures run one network against one test
+    // database; what the map exists for is the deployment that runs two, and the handler
+    // refusing a network it has no connection string for is itself under test below.
+    reconcileSql: { testnet: db() },
     indexer,
     idempotencyTtlDays: 30,
   }

@@ -265,7 +265,13 @@ const jobDeps: JobDeps = {
   signingSecret: env.outboxSigningSecret,
   assetTolerance: env.assetTolerance,
   reconcileAssets: env.reconcileAssets,
-  reconcileNetwork: env.reconcileNetwork,
+  reconcileNetworks: env.reconcileNetworks,
+  // The same two pools the HTTP side selects between, handed to the job runner as a map rather
+  // than a selector: a job has no request to resolve a network from, it has a payload.
+  reconcileSql: {
+    [ownNetwork]: sql as unknown as Db,
+    ...(sqlTestnet && ownNetwork !== 'testnet' ? { testnet: sqlTestnet as unknown as Db } : {}),
+  },
   indexer,
   idempotencyTtlDays: env.idempotencyTtlDays,
 }
