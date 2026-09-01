@@ -243,7 +243,8 @@ function jobDeps(indexer: JobDeps['indexer']): JobDeps {
     // non-zero drift below freezes. That is the behaviour under test, not a fixture convenience.
     assetTolerance: {},
     reconcileAssets: ['EMBER'],
-    reconcileNetwork: 'testnet',
+    reconcileNetworks: ['testnet'],
+    reconcileSql: {},
     indexer,
     idempotencyTtlDays: 30,
   }

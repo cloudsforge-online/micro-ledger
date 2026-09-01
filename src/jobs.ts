@@ -91,7 +91,16 @@ export interface JobDeps {
   readonly signingSecret: string
   readonly assetTolerance: AssetTolerance
   readonly reconcileAssets: readonly LedgerAssetCode[]
-  readonly reconcileNetwork: 'mainnet' | 'testnet'
+  readonly reconcileNetworks: readonly ('mainnet' | 'testnet')[]
+  /**
+   * The ledger database to reconcile against, per network.
+   *
+   * Separate from `sql` above, which is the JOB QUEUE's database and stays single: there is one
+   * queue, claimed by one replica, whichever networks it sweeps. What must be per-network is the
+   * ledger the sums are read from and the run row is written to — reconciling testnet and recording
+   * the result in the mainnet ledger would be worse than not reconciling it at all.
+   */
+  readonly reconcileSql: Partial<Record<'mainnet' | 'testnet', Db>>
   /**
    * Where a chain observation comes from, or `undefined` when this deployment has no indexer
    * configured.
@@ -130,7 +139,7 @@ export interface RecurringJob {
  * plus the reschedule on completion — so the interval survives a restart, is visible in a table an
  * operator can query, and is claimed by exactly one replica.
  */
-export function recurringJobs(deps: Pick<JobDeps, 'reconcileAssets' | 'reconcileNetwork'>): RecurringJob[] {
+export function recurringJobs(deps: Pick<JobDeps, 'reconcileAssets' | 'reconcileNetworks'>): RecurringJob[] {
   return [
     { kind: RELAY_KIND, key: 'stream', everyMs: 1_000 },
 
@@ -138,12 +147,26 @@ export function recurringJobs(deps: Pick<JobDeps, 'reconcileAssets' | 'reconcile
     // against no custody position, and the window between runs is the window in which such a
     // liability is withdrawable. Fifteen minutes is short enough to bound that and long enough not
     // to sum the chart of accounts continuously.
-    ...deps.reconcileAssets.map((assetCode) => ({
-      kind: RECONCILE_KIND,
-      key: `asset:${assetCode}`,
-      everyMs: 15 * MINUTE,
-      payload: { assetCode, network: deps.reconcileNetwork },
-    })),
+    /*
+     * THE KEY CARRIES THE NETWORK, and it did not before (micro-org#533).
+     *
+     * `onConflict: 'keep'` is keyed by (kind, key), so `asset:EMBER` for two networks would be ONE
+     * row and one of the two would never run. The network has to be in the key for the same reason
+     * it is in the payload.
+     *
+     * The rename also retires the old rows without a migration: `rescheduleRecurring` re-arms only
+     * keys present in THIS set, so a surviving `asset:EMBER` runs once more, completes, is not
+     * found in the map, and is never enqueued again. That is the existing "a job not in the set is
+     * not re-armed" rule doing the cleanup, not a special case added for it.
+     */
+    ...deps.reconcileNetworks.flatMap((network) =>
+      deps.reconcileAssets.map((assetCode) => ({
+        kind: RECONCILE_KIND,
+        key: `asset:${assetCode}:${network}`,
+        everyMs: 15 * MINUTE,
+        payload: { assetCode, network },
+      })),
+    ),
 
     // Nightly, per 04-domain-model.md §2.3. A full replay is the expensive check, so it runs on the
     // slowest cadence that still bounds how long a projection drift could go unnoticed.
@@ -381,13 +404,30 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
     ) {
       deps.metrics.increment('ledger_reconciliation_observe_retried_total', {
         asset: assetCode,
+        network,
         reason: first.reason,
       })
       await sleep(deps.unobservedRetryDelayMs ?? UNOBSERVED_RETRY_DELAY_MS)
       observation = await indexer.observe(chainSlug, network)
     }
 
-    const result = await reconcileAsset(deps.sql, {
+    /*
+     * The ledger for THIS run's network, not the process's own. A configured network with no
+     * connection string is a deploy fault and must be loud: throwing burns the attempt budget and
+     * dead-letters the job, which raises `jobs_dead_total` and `jobs_overdue`. Falling back to
+     * `deps.sql` would reconcile one network's chain against the other network's books and record
+     * a clean run for it — a wrong answer presented as a right one, which is the failure mode this
+     * whole change exists to remove.
+     */
+    const ledgerSql = deps.reconcileSql[network]
+    if (!ledgerSql) {
+      throw new Error(
+        `${RECONCILE_KIND} has no ledger database for network ${network} — ` +
+          `LEDGER_RECONCILE_NETWORK names it but no connection string was configured for it`,
+      )
+    }
+
+    const result = await reconcileAsset(ledgerSql, {
       assetCode: asset,
       chain: chainNameFor(asset),
       network,
@@ -415,10 +455,38 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
     // drift gauge is written only when a drift was actually computed, and
     // `ledger_reconciliation_observed` is what tells a dashboard whether to believe it. A gauge
     // cannot express "unknown", so the honest design is a second series that says so.
-    deps.metrics.set('ledger_reconciliation_observed', result.drift === null ? 0 : 1, { asset: assetCode })
+    /*
+     * EVERY SERIES BELOW CARRIES THE NETWORK, and none of them did before micro-org#533.
+     *
+     * While one process swept one network that was merely redundant. Sweeping two, it is a
+     * correctness bug: `{asset="EMBER"}` would be written by the mainnet run and then overwritten
+     * by the testnet run fifteen minutes later, so the gauge would alternate between two unrelated
+     * ledgers and the alert on it would flap between them. A label that is constant is free to
+     * omit; a label that has just become variable is not.
+     */
+    deps.metrics.set('ledger_reconciliation_observed', result.drift === null ? 0 : 1, {
+      asset: assetCode,
+      network,
+    })
     if (result.drift !== null) {
-      deps.metrics.set('ledger_reconciliation_drift', Number(result.drift), { asset: assetCode })
+      deps.metrics.set('ledger_reconciliation_drift', Number(result.drift), { asset: assetCode, network })
     }
+    /*
+     * WHEN THIS LAST RAN — the series that would have caught micro-org#533 on the first afternoon.
+     *
+     * `ledger_reconciliation_observed` already answers "did the last run see the chain", and the
+     * comment on its declaration explains that a gauge cannot say "unknown". It assumes a run
+     * happened. When the sweep itself stops, every series here simply freezes at its last value and
+     * a stale healthy number is indistinguishable from a fresh one — which is how testnet went
+     * seven days unreconciled with nothing firing.
+     *
+     * A timestamp is the one shape that cannot go stale silently: an alert reads `time() - value`,
+     * so not being written IS the signal rather than the absence of one.
+     */
+    deps.metrics.set('ledger_reconciliation_last_run_timestamp', Math.floor(Date.now() / 1000), {
+      asset: assetCode,
+      network,
+    })
     // **Labelled by reason, so an alert can tell the two freezes apart without a human reading a
     // log.** `ledger_reconciliation_observed` going to 0 was the only signal, and it fired
     // identically for "Hearth has not launched" — which is expected and is argued for in `env.ts` —
@@ -436,12 +504,14 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
     if (result.unobservedReason !== null && result.froze) {
       deps.metrics.increment('ledger_reconciliation_unobserved_freeze_total', {
         asset: assetCode,
+        network,
         reason: result.unobservedReason,
       })
     }
     if (result.unobservedReason !== null) {
       deps.metrics.increment('ledger_reconciliation_unobserved_total', {
         asset: assetCode,
+        network,
         reason: result.unobservedReason,
       })
     }

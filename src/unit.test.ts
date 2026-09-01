@@ -7,7 +7,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { isUuid, uuidv7 } from './ids.ts'
 import { namespacedKey, requestFingerprint } from './idempotency.ts'
-import { chainNameFor } from './jobs.ts'
+import { RECONCILE_KIND, chainNameFor, recurringJobs } from './jobs.ts'
 import { LedgerValidationError, WITHDRAWAL_KINDS, validateEntryRequest } from './entries.ts'
 import { parsePostEntry } from './server.ts'
 
@@ -194,4 +194,45 @@ test('a body with no postings is refused', () => {
     () => parsePostEntry({ kind: 'adjustment', originatingService: 'w', actor: 'system', idempotencyKey: 'k', postings: [] }, 'r'),
     /postings must be a non-empty array/,
   )
+})
+
+/*
+ * micro-org#533 — one process, both networks, one sweep.
+ *
+ * `LEDGER_RECONCILE_NETWORK` was a scalar. After the consolidation merged the two per-network
+ * ledger deployments into one, it still named `mainnet`, so the testnet sweep stopped on the day of
+ * the merge and stayed stopped for a week. Nothing failed: the jobs were simply never created, and
+ * the only reconciliation alert fires on a drift VALUE that a sweep which never runs cannot publish.
+ */
+test('recurring reconciliation fans out over every configured network', () => {
+  const jobs = recurringJobs({
+    reconcileAssets: ['SHARD', 'EMBER'] as const,
+    reconcileNetworks: ['mainnet', 'testnet'] as const,
+  })
+  const reconciles = jobs.filter((job) => job.kind === RECONCILE_KIND)
+
+  // Two assets on two networks is four jobs, not two.
+  assert.equal(reconciles.length, 4)
+  assert.deepEqual(
+    reconciles.map((job) => job.key).sort(),
+    ['asset:EMBER:mainnet', 'asset:EMBER:testnet', 'asset:SHARD:mainnet', 'asset:SHARD:testnet'],
+  )
+
+  // THE KEY MUST CARRY THE NETWORK. `seedRecurring` enqueues with `onConflict: 'keep'`, which is
+  // keyed by (kind, key) — so a key of `asset:EMBER` for both networks would collapse to one row
+  // and one of the two networks would never be swept. That is this defect, one layer down.
+  assert.equal(new Set(reconciles.map((job) => job.key)).size, reconciles.length)
+
+  // And the payload still states it, because the handler resolves its database from the payload.
+  for (const job of reconciles) {
+    const network = (job.payload as { network?: string }).network
+    assert.ok(network === 'mainnet' || network === 'testnet')
+    assert.ok(job.key.endsWith(`:${network}`), `${job.key} must agree with its payload network`)
+  }
+})
+
+test('a single configured network produces exactly the jobs it names', () => {
+  const jobs = recurringJobs({ reconcileAssets: ['EMBER'] as const, reconcileNetworks: ['testnet'] as const })
+  const reconciles = jobs.filter((job) => job.kind === RECONCILE_KIND)
+  assert.deepEqual(reconciles.map((job) => job.key), ['asset:EMBER:testnet'])
 })

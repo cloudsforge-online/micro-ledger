@@ -103,7 +103,8 @@ function jobDeps(indexer: IndexerClient | undefined): JobDeps {
     signingSecret: 'chainbacking-test-signing-secret-000',
     assetTolerance: {},
     reconcileAssets: ['EMBER'],
-    reconcileNetwork: 'testnet',
+    reconcileNetworks: ['testnet'],
+    reconcileSql: {},
     indexer,
     idempotencyTtlDays: 30,
     // micro-org#275 gives a transient absence ONE retry before it counts as a run. Production waits

@@ -134,7 +134,35 @@ test('a malformed or negative tolerance is refused rather than defaulted', () =>
 
 test('the network must be stated, never inferred', () => {
   assert.throws(() => loadEnv({ ...BASE, LEDGER_RECONCILE_NETWORK: 'devnet' }), /mainnet or testnet/)
-  assert.equal(loadEnv({ ...BASE, LEDGER_RECONCILE_NETWORK: 'mainnet' }).reconcileNetwork, 'mainnet')
+  assert.deepEqual(loadEnv({ ...BASE, LEDGER_RECONCILE_NETWORK: 'mainnet' }).reconcileNetworks, ['mainnet'])
+})
+
+/*
+ * micro-org#533. This was a scalar, and one process now serves both networks. The merge left it
+ * naming `mainnet`, so the testnet sweep stopped on the day of the merge and nothing said so — the
+ * only reconciliation alert fires on a drift VALUE, and a sweep that never runs publishes none.
+ */
+test('LEDGER_RECONCILE_NETWORK is a LIST, so one process can sweep both networks', () => {
+  assert.deepEqual(loadEnv({ ...BASE, LEDGER_RECONCILE_NETWORK: 'mainnet,testnet' }).reconcileNetworks, [
+    'mainnet',
+    'testnet',
+  ])
+  // Whitespace is the operator's, not the parser's problem.
+  assert.deepEqual(loadEnv({ ...BASE, LEDGER_RECONCILE_NETWORK: ' testnet , mainnet ' }).reconcileNetworks, [
+    'testnet',
+    'mainnet',
+  ])
+  // A repeat in a manifest is a typo, not a request to sweep twice.
+  assert.deepEqual(
+    loadEnv({ ...BASE, LEDGER_RECONCILE_NETWORK: 'mainnet,mainnet' }).reconcileNetworks,
+    ['mainnet'],
+  )
+  // One bad entry fails the whole value. A list that silently drops what it cannot parse is how a
+  // network stops being swept without anyone deciding that it should.
+  assert.throws(() => loadEnv({ ...BASE, LEDGER_RECONCILE_NETWORK: 'mainnet,devnet' }), /mainnet or testnet/)
+  // Empty is refused rather than defaulted — see the field comment for why the escape hatch is the
+  // asset list instead.
+  assert.throws(() => loadEnv({ ...BASE, LEDGER_RECONCILE_NETWORK: ' , ' }), /at least one network/)
 })
 
 test('the reconciled asset list must not be empty', () => {
