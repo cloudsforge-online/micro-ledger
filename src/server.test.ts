@@ -54,6 +54,9 @@ const verifier: PrincipalVerifier = {
   },
 }
 
+/** Signs the inbound `identity.user.deleted` deliveries `POST /v1/events` verifies. */
+const EVENT_SECRET = 'a-real-looking-secret-of-sufficient-length'
+
 let sql: postgres.Sql
 let server: Server
 let baseUrl: string
@@ -75,6 +78,7 @@ before(async () => {
     sql: singleNetworkSql(sql as unknown as Db),
     singleNetwork: 'mainnet' as const,
     producer: 'ledger',
+    eventSigningSecret: EVENT_SECRET,
   })
   await new Promise<void>((resolve) => server.listen(0, () => resolve()))
   lifecycle.markReady()

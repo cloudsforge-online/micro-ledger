@@ -56,7 +56,9 @@ import {
 } from './entries.ts'
 import { IdempotencyInFlightError, IdempotencyKeyReuseError, requestFingerprint } from './idempotency.ts'
 import { latestRuns, listFreezes } from './reconcile.ts'
-import type { Db } from './outbox.ts'
+import { SIGNATURE_HEADER, verifyEventSignature, withInbox, type Db } from './outbox.ts'
+import { USER_DELETED_TOPIC, eraseSubject } from './erasure.ts'
+import { eraseEveryPlane } from './erasureplanes.ts'
 
 /** The verifier as this file needs it. An interface, so a test does not need a JWKS. */
 export interface PrincipalVerifier {
@@ -73,6 +75,14 @@ export interface ServerDeps {
    * methods, so reaching for the process-wide handle does not compile.
    */
   readonly sql: NetworkSql
+  /**
+   * The estate-wide `OUTBOX_SIGNING_SECRET`, used here to VERIFY an inbound delivery.
+   *
+   * The same key this service signs its own outbound events with — `identity` signs with it too,
+   * so a delivery it produced verifies here with no second secret to provision or rotate. See
+   * `POST /v1/events`.
+   */
+  readonly eventSigningSecret: string
   /**
    * The network to assume when no `CF-Network` arrives, or `undefined` to refuse. `CF_NETWORK_SINGLE`,
    * for `pnpm dev`, which has no gateway in front of it. Never set in production.
@@ -228,6 +238,9 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
 
 const SAFE_REQUEST_ID = /^[A-Za-z0-9_-]{1,64}$/
 const MAX_BODY_BYTES = 256 * 1024
+
+/** The uuid shape an event id and `payload.userId` must both have. Anchored. */
+const ERASURE_UUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/
 
 interface Reply {
   readonly status: number
@@ -533,6 +546,110 @@ function buildRoutes(): Route[] {
         status: 200,
         text: deps.metrics.render(),
         contentType: 'text/plain; version=0.0.4; charset=utf-8',
+      }
+    }),
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    // THE ONE INBOUND EVENT THIS SERVICE CONSUMES.
+    //
+    // The ledger publishes and does not subscribe — except to `identity.user.deleted`, which every
+    // service holding a reference to a person must act on (rule 6, `deploy/erasure/register.psv`).
+    // It had no route at all, so 101 delivered erasures had nowhere to arrive and
+    // `accounts.subject` still named every person who had ever asked to be forgotten
+    // (micro-org#534).
+    //
+    // NO NEW SECRET. The signature is verified with `OUTBOX_SIGNING_SECRET`, which this service
+    // already reads to SIGN its own outbound deliveries — one estate-wide key, the same one
+    // identity signs with. A separate accept list would be a second secret to provision, rotate
+    // and forget.
+    //
+    // THE MAC IS THE CREDENTIAL, so an unsigned or wrongly-signed body is 401 and never reaches a
+    // parser. `POST /entries` above takes a bearer token; this route does not and must not — the
+    // relay is a service with no user token, and demanding one would mean an erasure that can
+    // never be delivered.
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    define('POST', '/v1/events', async (ctx, deps) => {
+      const raw = await readRawBody(ctx.req)
+      const presented = headerOf(ctx.req, SIGNATURE_HEADER)
+      if (!presented || !verifyEventSignature(raw.toString('utf8'), deps.eventSigningSecret, presented)) {
+        deps.metrics.increment('ledger_events_rejected_total', { reason: 'bad_signature' })
+        ctx.log.warn('an inbound event failed its signature check')
+        return errorReply(401, 'bad_signature', 'the event signature did not verify', ctx.requestId)
+      }
+
+      let envelope: Record<string, unknown>
+      try {
+        const parsed: unknown = JSON.parse(raw.toString('utf8'))
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+          throw new LedgerValidationError('an event envelope must be a JSON object')
+        }
+        envelope = parsed as Record<string, unknown>
+      } catch (err) {
+        deps.metrics.increment('ledger_events_rejected_total', { reason: 'malformed' })
+        if (err instanceof LedgerValidationError) throw err
+        throw new LedgerValidationError('the event body is not valid JSON')
+      }
+
+      const topic = typeof envelope['topic'] === 'string' ? envelope['topic'] : ''
+      const eventId = typeof envelope['id'] === 'string' ? envelope['id'] : ''
+      if (!ERASURE_UUID.test(eventId)) {
+        deps.metrics.increment('ledger_events_rejected_total', { reason: 'malformed' })
+        throw new LedgerValidationError('an event envelope must carry a uuid id')
+      }
+      if (topic !== USER_DELETED_TOPIC) {
+        // Accepted and ignored, with a 202. A 4xx would make the producer's relay retry an event
+        // it is correct to send and we are correct not to act on, for ever.
+        deps.metrics.increment('ledger_events_rejected_total', { reason: 'not_subscribed' })
+        return { status: 202, body: { status: 'ignored', topic } }
+      }
+
+      const payload =
+        typeof envelope['payload'] === 'object' && envelope['payload'] !== null
+          ? (envelope['payload'] as Record<string, unknown>)
+          : {}
+      // `payload.userId`, not `envelope.actor`: on this topic the actor is whoever ASKED for the
+      // deletion, which is the deleted user only when they deleted themselves. Validated HERE,
+      // outside the sweep — an envelope is malformed once, not once per database, and a 400 the
+      // relay must not retry has to stay distinguishable from a 5xx it should.
+      const named = typeof payload['userId'] === 'string' ? payload['userId'] : ''
+      const bare = named.startsWith('user:') ? named.slice('user:'.length) : named
+      if (!ERASURE_UUID.test(bare)) {
+        deps.metrics.increment('ledger_events_rejected_total', { reason: 'malformed' })
+        // 400 rather than a quiet 202: an erasure we cannot perform must not be acknowledged as
+        // performed.
+        throw new LedgerValidationError(`${USER_DELETED_TOPIC} requires a uuid userId`)
+      }
+
+      const done = deps.lifecycle.track()
+      try {
+        // EVERY plane, from the SELECTOR. `ctx.sql` is one resolved handle and this delivery
+        // carries no `CF-Network`, so it would always be mainnet's (micro-org#474).
+        const sweep = await eraseEveryPlane(deps.sql, (handle: Db) =>
+          withInbox(handle, topic, eventId, (tx) => eraseSubject(tx, `user:${bare}`)),
+        )
+        // Counts only. The subject is never logged — it is what we were asked to forget.
+        for (const plane of sweep.planes) {
+          if (plane.value) {
+            ctx.log.info('anonymised a subject on identity.user.deleted', {
+              eventId,
+              network: plane.network,
+              ...plane.value,
+            })
+          }
+        }
+        return {
+          status: 202,
+          body: {
+            status: sweep.processed === 0 ? 'duplicate' : 'anonymised',
+            planes: sweep.planes.map((plane) => ({
+              network: plane.network,
+              status: plane.status,
+              ...(plane.value ?? {}),
+            })),
+          },
+        }
+      } finally {
+        done()
       }
     }),
 
@@ -846,6 +963,25 @@ function attribute(
 }
 
 /* ------------------------------------------------------------------------ body parsing */
+
+/**
+ * The exact bytes the socket carried, for a signature check.
+ *
+ * Separate from `readJson` because a MAC is computed over BYTES: re-serialising a parsed object
+ * changes key order and whitespace and would fail against a signature the producer computed over
+ * its own rendering. Same cap, for the same reason.
+ */
+async function readRawBody(req: IncomingMessage): Promise<Buffer> {
+  const chunks: Buffer[] = []
+  let size = 0
+  for await (const chunk of req) {
+    const buffer = chunk as Buffer
+    size += buffer.length
+    if (size > MAX_BODY_BYTES) throw new LedgerValidationError('request body too large')
+    chunks.push(buffer)
+  }
+  return Buffer.concat(chunks)
+}
 
 async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = []
