@@ -144,6 +144,9 @@ const server = createServer({
   // request; it only answers the internal callers that never had one.
   singleNetwork: ownNetwork,
   producer: SERVICE,
+  // Verifies an inbound `identity.user.deleted`. The same estate-wide key this service signs its
+  // own outbound deliveries with — see `POST /v1/events` in `server.ts` (micro-org#534).
+  eventSigningSecret: env.outboxSigningSecret,
   // Sampled at scrape time rather than on a timer. There is no `setInterval` in this repository
   // and CI greps for one — rule 8. A scrape is already periodic, so the scrape is when to sample.
   beforeScrape: async () => {
